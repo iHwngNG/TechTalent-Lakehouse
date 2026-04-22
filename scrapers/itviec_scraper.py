@@ -1,0 +1,235 @@
+"""
+ITviec Job Crawler — Refactored using BaseScraper & Crawl4AI
+"""
+import os
+import sys
+import asyncio
+import argparse
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# Add project root to sys.path for cross-module imports
+PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from bs4 import BeautifulSoup
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+
+# Import base class and utils
+from scrapers.base_scraper import BaseScraper, async_retry
+
+BASE_URL = "https://itviec.com"
+LIST_URL = f"{BASE_URL}/it-jobs"
+
+def parse_relative_date(text: str) -> str:
+    """Convert relative time string to actual date (YYYY-MM-DD)."""
+    if not text:
+        return ""
+    text_lower = text.strip().lower()
+    unit_map = {
+        "second": "seconds", "giây": "seconds",
+        "minute": "minutes", "phút": "minutes",
+        "hour": "hours", "giờ": "hours",
+        "day": "days", "ngày": "days",
+        "week": "weeks", "tuần": "weeks",
+    }
+    try:
+        parts = text_lower.split()
+        value = None
+        unit_raw = ""
+        for i, part in enumerate(parts):
+            if part.isdigit():
+                value = int(part)
+                unit_raw = parts[i + 1] if i + 1 < len(parts) else ""
+                break
+        if value is None or not unit_raw:
+            return text
+        now = datetime.now(timezone.utc)
+        if "month" in unit_raw or "tháng" in unit_raw:
+            return (now - timedelta(days=value * 30)).strftime("%Y-%m-%d")
+        if "year" in unit_raw or "năm" in unit_raw:
+            return (now - timedelta(days=value * 365)).strftime("%Y-%m-%d")
+        for keyword, td_arg in unit_map.items():
+            if keyword in unit_raw:
+                return (now - timedelta(**{td_arg: value})).strftime("%Y-%m-%d")
+        return text
+    except (ValueError, IndexError):
+        return text
+
+class ItviecScraper(BaseScraper):
+    def __init__(self):
+        super().__init__(source_name="itviec")
+        self.browser_config = BrowserConfig(
+            headless=True,
+            viewport_width=1920,
+            viewport_height=1080,
+        )
+
+    def _extract_slugs_from_html(self, html: str) -> list:
+        """Extract job slugs from the search results HTML using BeautifulSoup."""
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.select("div.job-card")
+        slugs = []
+        for card in cards:
+            slug = card.get("data-search--job-selection-job-slug-value")
+            if slug and slug.strip():
+                slugs.append(slug.strip())
+        return slugs
+
+    def _get_max_pages(self, html: str) -> int:
+        """Auto-detect total number of pages from the pagination."""
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            links = soup.select("nav div.page a")
+            max_page = 1
+            for link in links:
+                text = link.get_text(strip=True)
+                if text.isdigit():
+                    max_page = max(max_page, int(text))
+            return max_page
+        except Exception as e:
+            self.logger.warning(f"Could not detect max pages ({e}), defaulting to 1")
+            return 1
+
+    def _extract_detail_from_html(self, html: str, slug: str, url: str) -> dict:
+        """Extract structured job details from the job detail HTML using BeautifulSoup."""
+        soup = BeautifulSoup(html, "html.parser")
+        
+        title_el = soup.select_one("h1.job-name, h1[class*='job-name'], h1")
+        title = title_el.get_text(strip=True) if title_el else ""
+        
+        company_el = soup.select_one("div.employer-name")
+        company = company_el.get_text(strip=True) if company_el else ""
+        
+        salary_el = soup.select_one("a.sign-in-view-salary")
+        salary = salary_el.get_text(strip=True) if salary_el else ""
+        
+        # Text info elements like location, working method, posted date
+        info_els = soup.select("span.normal-text.text-rich-grey")
+        locations = info_els[0].get_text(strip=True) if len(info_els) > 0 else ""
+        working_method = info_els[1].get_text(strip=True) if len(info_els) > 1 else ""
+        posted_raw = info_els[2].get_text(strip=True) if len(info_els) > 2 else ""
+        posted_date = parse_relative_date(posted_raw)
+        
+        # Skills and Expertise
+        itags = soup.select("a.itag")
+        skills = [tag.get_text(strip=True) for tag in itags]
+        
+        desc_el = soup.select_one("section.job-content")
+        description = desc_el.get_text(separator="\n", strip=True) if desc_el else ""
+        
+        return {
+            "job_id": f"itviec_{slug}",
+            "title": title,
+            "company": company,
+            "salary": salary,
+            "locations": locations,
+            "working_method": working_method,
+            "skills": skills,
+            "posted_date": posted_date,
+            "description": description,
+            "source": self.source_name,
+            "url": url,
+            "crawled_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @async_retry(max_retries=3, base_delay=2.0)
+    async def scrape(self, max_pages: int = 0) -> list:
+        crawler_config = CrawlerRunConfig(
+            page_timeout=60000,
+            wait_for="css:div.job-card",  # Wait for job cards to load
+            remove_overlay_elements=True,
+        )
+
+        all_jobs = []
+        
+        async with AsyncWebCrawler(config=self.browser_config) as crawler:
+            self.logger.info(f"Fetching page 1 from {LIST_URL}...")
+            result = await crawler.arun(url=LIST_URL, config=crawler_config)
+            
+            if not result.success:
+                self.logger.error(f"Failed to fetch page 1: {result.error_message}")
+                raise Exception(f"Failed to fetch page 1: {result.error_message}")
+                
+            slugs = self._extract_slugs_from_html(result.html)
+            self.logger.info(f"Page 1: Found {len(slugs)} job slugs.")
+            
+            # Auto-detect total pages if max_pages is 0
+            if max_pages <= 0:
+                max_pages = self._get_max_pages(result.html)
+                self.logger.info(f"Auto-detect mode: will crawl all {max_pages} pages")
+            else:
+                self.logger.info(f"Manual mode: will crawl {max_pages} pages")
+
+            all_slugs = set(slugs)
+            
+            # Crawl subsequent pages
+            for page_num in range(2, max_pages + 1):
+                url = f"{LIST_URL}?page={page_num}"
+                self.logger.info(f"Fetching page {page_num} from {url}...")
+                res = await crawler.arun(url=url, config=crawler_config)
+                if res.success:
+                    page_slugs = self._extract_slugs_from_html(res.html)
+                    self.logger.info(f"Page {page_num}: Found {len(page_slugs)} job slugs.")
+                    if not page_slugs:
+                        break
+                    all_slugs.update(page_slugs)
+                else:
+                    self.logger.error(f"Failed to fetch page {page_num}")
+                    break
+            
+            self.logger.info(f"Total unique slugs collected: {len(all_slugs)}")
+            if not all_slugs:
+                return []
+
+            detail_urls = [f"{LIST_URL}/{slug}" for slug in all_slugs]
+            
+            detail_crawler_config = CrawlerRunConfig(
+                page_timeout=60000,
+                wait_for="css:h1",  # Wait for title to load
+                remove_overlay_elements=True,
+            )
+
+            self.logger.info(f"Extracting details for {len(detail_urls)} jobs concurrently...")
+            results = await crawler.arun_many(
+                urls=detail_urls,
+                config=detail_crawler_config,
+                max_concurrent=5
+            )
+            
+            all_slugs_list = list(all_slugs)
+            for i, res in enumerate(results):
+                if res.success:
+                    slug = all_slugs_list[i]
+                    job_data = self._extract_detail_from_html(res.html, slug, res.url)
+                    if job_data["title"]:
+                        all_jobs.append(job_data)
+                else:
+                    self.logger.error(f"Failed to fetch {res.url}")
+            
+        self.logger.info(f"Successfully extracted {len(all_jobs)} jobs.")
+        return all_jobs
+
+async def main():
+    parser = argparse.ArgumentParser(description="ITviec Crawler (OOP + Crawl4AI)")
+    parser.add_argument("--pages", type=int, default=0, help="Number of pages to crawl (0 = all pages)")
+    parser.add_argument("--output", type=str, default="itviec_jobs.jsonl", help="Output JSONL file")
+    args = parser.parse_args()
+    
+    scraper = ItviecScraper()
+    
+    # 1. Scrape
+    jobs = await scraper.scrape(max_pages=args.pages)
+    
+    if jobs:
+        # 2. Save
+        scraper.save(jobs, args.output)
+        
+        # 3. Upload DBFS
+        date_str = datetime.now().strftime("%Y%m%d")
+        dbfs_path = f"/landing/itviec/{date_str}/{os.path.basename(args.output)}"
+        scraper.upload_to_dbfs(args.output, dbfs_path)
+
+if __name__ == "__main__":
+    asyncio.run(main())
