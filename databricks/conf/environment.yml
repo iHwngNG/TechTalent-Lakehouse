@@ -1,0 +1,12 @@
+name: techtalent-lakehouse-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - beautifulsoup4>=4.12.0
+      - lxml>=4.9.0
+      - requests>=2.31.0
+      - crawl4ai>=0.2.0
