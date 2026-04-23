@@ -5,7 +5,6 @@ ITviec Job Crawler — Refactored using BaseScraper & Crawl4AI
 import os
 import sys
 import asyncio
-import random
 import argparse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -152,7 +151,15 @@ class ItviecScraper(BaseScraper):
         }
 
     @async_retry(max_retries=3, base_delay=2.0)
-    async def scrape(self, max_pages: int = 0) -> list:
+    async def scrape(self, max_pages: int = 0, existing=None) -> list:
+        """
+        Scrape ITviec job listings.
+        existing: set of (job_id, posted_date) tuples from BaseScraper.load_existing_records().
+        Only jobs that pass self.is_new_job() will have their details fetched.
+        """
+        if existing is None:
+            existing = set()
+
         # Stealth init script injected BEFORE page navigation (context-level)
         # This patches navigator.webdriver before any Cloudflare checks run.
         stealth_init_js = """
@@ -168,9 +175,10 @@ class ItviecScraper(BaseScraper):
             remove_overlay_elements=True,
         )
 
-        all_jobs = []
+        all_slugs = set()
 
         async with AsyncWebCrawler(config=self.browser_config) as crawler:
+            # Fetch page 1 first to get total pages and initial slugs
             self.logger.info(f"Fetching page 1 from {LIST_URL}...")
             result = await crawler.arun(url=LIST_URL, config=crawler_config)
 
@@ -181,43 +189,55 @@ class ItviecScraper(BaseScraper):
             slugs = self._extract_slugs_from_html(result.html)
             self.logger.info(f"Page 1: Found {len(slugs)} job slugs.")
 
-            # Auto-detect total pages if max_pages is 0
             if max_pages <= 0:
                 max_pages = self._get_max_pages(result.html)
                 self.logger.info(f"Auto-detect mode: will crawl all {max_pages} pages")
             else:
                 self.logger.info(f"Manual mode: will crawl {max_pages} pages")
 
-            all_slugs = set(slugs)
+            all_slugs.update(slugs)
 
-            # Crawl subsequent pages
-            for page_num in range(2, max_pages + 1):
-                url = f"{LIST_URL}?page={page_num}"
-                self.logger.info(f"Fetching page {page_num} from {url}...")
-                res = await crawler.arun(url=url, config=crawler_config)
-                if res.success:
-                    page_slugs = self._extract_slugs_from_html(res.html)
-                    self.logger.info(
-                        f"Page {page_num}: Found {len(page_slugs)} job slugs."
-                    )
-                    if not page_slugs:
-                        break
-                    all_slugs.update(page_slugs)
-                else:
-                    self.logger.error(f"Failed to fetch page {page_num}")
-                    break
+            # Crawl remaining pages concurrently in batches of 5
+            remaining_pages = list(range(2, max_pages + 1))
+            batch_size = 5
+            for i in range(0, len(remaining_pages), batch_size):
+                batch = remaining_pages[i : i + batch_size]
+                tasks = [
+                    crawler.arun(url=f"{LIST_URL}?page={p}", config=crawler_config)
+                    for p in batch
+                ]
+                batch_results = await asyncio.gather(*tasks)
+                for page_num, res in zip(batch, batch_results):
+                    if res.success:
+                        page_slugs = self._extract_slugs_from_html(res.html)
+                        self.logger.info(
+                            f"Page {page_num}: Found {len(page_slugs)} job slugs."
+                        )
+                        if not page_slugs:
+                            break
+                        all_slugs.update(page_slugs)
+                    else:
+                        self.logger.error(f"Failed to fetch page {page_num}")
 
-        self.logger.info(f"Total unique slugs collected: {len(all_slugs)}")
-        if not all_slugs:
+        # Pre-filter by job_id before fetching details (fast O(1) set lookup)
+        existing_job_ids = {jid for (jid, _) in existing}
+        new_slugs = {
+            slug for slug in all_slugs if f"itviec_{slug}" not in existing_job_ids
+        }
+        skipped = len(all_slugs) - len(new_slugs)
+        self.logger.info(
+            f"Total slugs: {len(all_slugs)} | New: {len(new_slugs)} | Skipped (existing): {skipped}"
+        )
+
+        if not new_slugs:
+            self.logger.info("No new jobs to scrape.")
             return []
 
         # Crawl detail pages using direct Playwright CDP with add_init_script()
         # This injects stealth JS BEFORE any page JS runs, bypassing Cloudflare.
-        detail_urls = [f"{LIST_URL}/{slug}" for slug in all_slugs]
         cdp_url = os.environ.get("BROWSER_WS_URL", "ws://localhost:3000")
-
         self.logger.info(
-            f"Extracting details for {len(detail_urls)} jobs via Playwright CDP..."
+            f"Extracting details for {len(new_slugs)} new jobs via Playwright CDP..."
         )
 
         async def fetch_detail(
@@ -250,20 +270,23 @@ class ItviecScraper(BaseScraper):
 
         async with async_playwright() as pw:
             browser = await pw.chromium.connect_over_cdp(cdp_url)
-            semaphore = asyncio.Semaphore(3)  # Max 3 concurrent detail pages
-            slugs_list = list(all_slugs)
+            semaphore = asyncio.Semaphore(5)  # 5 concurrent detail pages for speed
             tasks = [
                 fetch_detail(browser, f"{LIST_URL}/{slug}", slug, semaphore)
-                for slug in slugs_list
+                for slug in new_slugs
             ]
             results = await asyncio.gather(*tasks)
             await browser.close()
 
+        all_jobs = []
         for job_data in results:
-            if job_data.get("title"):
+            # Final check: apply posted_date dedup via BaseScraper.is_new_job()
+            if job_data.get("title") and self.is_new_job(
+                job_data["job_id"], job_data.get("posted_date", ""), existing
+            ):
                 all_jobs.append(job_data)
 
-        self.logger.info(f"Successfully extracted {len(all_jobs)} jobs.")
+        self.logger.info(f"Successfully extracted {len(all_jobs)} new jobs.")
         return all_jobs
 
 
@@ -272,24 +295,20 @@ async def main():
     parser.add_argument(
         "--pages", type=int, default=0, help="Number of pages to crawl (0 = all pages)"
     )
-    parser.add_argument(
-        "--output", type=str, default="itviec_jobs.jsonl", help="Output JSONL file"
-    )
     args = parser.parse_args()
 
     scraper = ItviecScraper()
 
-    # 1. Scrape
-    jobs = await scraper.scrape(max_pages=args.pages)
+    # Load existing (job_id, posted_date) pairs from volume for incremental scraping
+    scraper.logger.info(f"Loading existing records from: {scraper.volume_dir}")
+    existing = scraper.load_existing_records()
+    scraper.logger.info(f"Found {len(existing)} existing records.")
+
+    # Scrape only new jobs
+    jobs = await scraper.scrape(max_pages=args.pages, existing=existing)
 
     if jobs:
-        # 2. Save
-        scraper.save(jobs, args.output)
-
-        # 3. Upload DBFS
-        date_str = datetime.now().strftime("%Y%m%d")
-        dbfs_path = f"/landing/itviec/{date_str}/{os.path.basename(args.output)}"
-        scraper.upload_to_dbfs(args.output, dbfs_path)
+        scraper.save_to_volume(jobs)
 
     # Windows Proactor cleanup
     if sys.platform == "win32":
@@ -298,15 +317,12 @@ async def main():
 
 if __name__ == "__main__":
     if sys.platform == "win32":
-        # Suppress the "Exception ignored in: ... ValueError: I/O operation on closed pipe" 
-        # which is a known bug in Python 3.9 asyncio on Windows.
-        import sys
-        
+        # Suppress the known bug: ValueError: I/O operation on closed pipe
         def custom_unraisablehook(unraisable):
             if unraisable.exc_type == ValueError and str(unraisable.exc_value) == "I/O operation on closed pipe":
                 return
             sys.__unraisablehook__(unraisable)
-            
+
         sys.unraisablehook = custom_unraisablehook
 
     asyncio.run(main())
