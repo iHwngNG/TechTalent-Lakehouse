@@ -91,9 +91,9 @@ class BaseScraper(abc.ABC):
     Provides shared logic for:
     - Incremental scraping: load existing (job_id, posted_date) pairs from the
       Volume directory so child scrapers can skip already-known jobs.
-    - Volume-based persistence: append new records to a per-day JSONL file inside
-      the Databricks Unity Catalog Volume.
-    - Legacy JSONL save for local development.
+    - Micro-batch persistence: validate + append each page-worth of records
+      immediately via save_batch(), so a crash only loses the current page.
+    - Centralized error logging to a shared Volume path.
     """
 
     def __init__(self, source_name: str):
@@ -171,6 +171,36 @@ class BaseScraper(abc.ABC):
             critical_fields=critical_fields,
             threshold=threshold,
         )
+
+    def save_batch(
+        self,
+        batch: list,
+        critical_fields: tuple = ("title", "company"),
+    ) -> int:
+        """
+        Micro-batch checkpoint: validate quality then immediately append to Volume.
+
+        Call this once per page inside the scraping loop instead of accumulating
+        all results in memory. If the pipeline crashes mid-run, every batch
+        written before the crash is preserved — the next run will skip those
+        records via load_existing_records().
+
+        Args:
+            batch           : list of job dicts from a single page
+            critical_fields : fields checked by the quality gate
+
+        Returns:
+            Number of records saved (0 if batch is empty or fails quality gate).
+
+        Raises:
+            DataQualityError: propagated from validate_quality() when the
+                              website DOM has changed and data is mostly empty.
+        """
+        if not batch:
+            return 0
+        self.validate_quality(batch, critical_fields=critical_fields)
+        self.save_to_volume(batch)
+        return len(batch)
 
     def save_to_volume(self, data: list) -> str:
         """
