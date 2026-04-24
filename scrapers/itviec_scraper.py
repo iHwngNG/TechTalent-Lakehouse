@@ -262,21 +262,51 @@ class ItviecScraper(BaseScraper):
         async with async_playwright() as pw:
             browser = await pw.chromium.connect_over_cdp(cdp_url)
             semaphore = asyncio.Semaphore(5)
-            tasks = [
-                fetch_detail(browser, f"{LIST_URL}/{slug}", slug, semaphore)
-                for slug in new_slugs
-            ]
-            results = await asyncio.gather(*tasks)
+
+            # Process slugs in page-sized batches so every completed batch is
+            # checkpointed immediately via save_batch(). A crash only loses the
+            # current batch — the next run resumes from where it left off.
+            BATCH_SIZE = 30
+            slug_list = list(new_slugs)
+            total_saved = 0
+
+            for i in range(0, len(slug_list), BATCH_SIZE):
+                batch_slugs = slug_list[i: i + BATCH_SIZE]
+                batch_num = i // BATCH_SIZE + 1
+                self.logger.info(
+                    f"Batch {batch_num}: fetching {len(batch_slugs)} jobs "
+                    f"({i + 1}–{min(i + BATCH_SIZE, len(slug_list))} of {len(slug_list)})"
+                )
+
+                tasks = [
+                    fetch_detail(browser, f"{LIST_URL}/{slug}", slug, semaphore)
+                    for slug in batch_slugs
+                ]
+                results = await asyncio.gather(*tasks)
+
+                batch_jobs = [
+                    job for job in results
+                    if job.get("title") and self.is_new_job(
+                        job["job_id"], job.get("posted_date", ""), existing
+                    )
+                ]
+
+                if batch_jobs:
+                    saved = self.save_batch(batch_jobs)  # validate + checkpoint
+                    total_saved += saved
+                    # Update in-memory set so later batches skip these records
+                    for job in batch_jobs:
+                        existing.add((job["job_id"], job.get("posted_date", "")))
+                    self.logger.info(
+                        f"Batch {batch_num}: checkpointed {saved} jobs "
+                        f"(total so far: {total_saved})"
+                    )
+
             await browser.close()
 
-        all_jobs = [
-            job for job in results
-            if job.get("title") and self.is_new_job(
-                job["job_id"], job.get("posted_date", ""), existing
-            )
-        ]
-        self.logger.info(f"Successfully extracted {len(all_jobs)} new jobs.")
-        return all_jobs
+        self.logger.info(f"Scrape complete. Total new jobs saved: {total_saved}")
+        # Return empty list — micro-batching already persisted everything above
+        return []
 
 
 async def main():
@@ -293,11 +323,8 @@ async def main():
         existing = scraper.load_existing_records()
         scraper.logger.info(f"Found {len(existing)} existing records.")
 
-        jobs = await scraper.scrape(max_pages=args.pages, existing=existing)
-
-        if jobs:
-            scraper.validate_quality(jobs)  # Abort if website DOM changed
-            scraper.save_to_volume(jobs)
+        # scrape() now handles micro-batch checkpointing internally via save_batch()
+        await scraper.scrape(max_pages=args.pages, existing=existing)
 
     except Exception as e:
         # Write structured error to /Volumes/workspace/techtalent_lakehouse/error/
