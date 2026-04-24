@@ -4,9 +4,15 @@ import json
 import os
 import logging
 import functools
-from datetime import datetime
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Set, Tuple
+
+from src.validators.bronze.data_quality_validator import (
+    validate_bronze_data,
+    DQ_EMPTY_THRESHOLD,
+)
 
 # Structured logging configuration
 logging.basicConfig(
@@ -17,6 +23,11 @@ logging.basicConfig(
 
 # Base Databricks Volume path — each scraper writes to its own subdirectory
 VOLUME_BASE = "/Volumes/workspace/techtalent_lakehouse/raws"
+
+# Centralized error log — all scrapers share one daily file
+ERROR_VOLUME = "/Volumes/workspace/techtalent_lakehouse/error"
+
+# Structured logging configuration
 
 
 def retry(max_retries=3, base_delay=2.0):
@@ -145,6 +156,22 @@ class BaseScraper(abc.ABC):
     # Persistence
     # ──────────────────────────────────────────────────────────────────────────
 
+    def validate_quality(
+        self,
+        data: list,
+        critical_fields: tuple = ("title", "company"),
+        threshold: float = DQ_EMPTY_THRESHOLD,
+    ) -> None:
+        """
+        Data Quality Gate — delegates to the centralized bronze layer validator.
+        """
+        validate_bronze_data(
+            data=data,
+            source_name=self.source_name,
+            critical_fields=critical_fields,
+            threshold=threshold,
+        )
+
     def save_to_volume(self, data: list) -> str:
         """
         Append new job records to the scraper's daily JSONL file inside the
@@ -179,6 +206,45 @@ class BaseScraper(abc.ABC):
             for item in data:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         self.logger.info(f"Saved {len(data)} records to {output_path}")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Error logging
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def save_error(self, error: Exception, context: str = "") -> None:
+        """
+        Append a structured error record to the shared daily error JSONL file
+        in the Databricks Volume at /Volumes/workspace/techtalent_lakehouse/error/.
+
+        Schema (minimal, queryable by Spark):
+            timestamp   : ISO-8601 UTC string
+            source      : scraper name (e.g. 'itviec')
+            error_type  : exception class name
+            error_msg   : short error message
+            context     : where in the pipeline the error occurred
+            traceback   : full stack trace for debugging
+        """
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": self.source_name,
+            "error_type": type(error).__name__,
+            "error_msg": str(error),
+            "context": context,
+            "traceback": traceback.format_exc(),
+        }
+        try:
+            Path(ERROR_VOLUME).mkdir(parents=True, exist_ok=True)
+            date_str = datetime.now().strftime("%Y%m%d")
+            error_path = os.path.join(ERROR_VOLUME, f"errors_{date_str}.jsonl")
+            with open(error_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self.logger.error(
+                f"[{context}] {type(error).__name__}: {error} — logged to {error_path}"
+            )
+        except Exception as write_err:
+            # Last-resort: if writing to Volume also fails, only log locally
+            self.logger.error(f"Failed to write error to volume: {write_err}")
+            self.logger.error(f"Original error — [{context}] {error}")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Abstract interface
