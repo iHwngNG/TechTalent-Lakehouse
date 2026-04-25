@@ -24,6 +24,10 @@ elif not PROJECT_ROOT:
 
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from typing import List, Set, Tuple, Dict
+from urllib.parse import urljoin
+
+from src.validators.bronze.url_validator import validate_urls
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
 from scrapers.base_scraper import BaseScraper, async_retry
@@ -38,11 +42,16 @@ def parse_relative_date(text: str) -> str:
         return ""
     text_lower = text.strip().lower()
     unit_map = {
-        "second": "seconds", "giây": "seconds",
-        "minute": "minutes", "phút": "minutes",
-        "hour": "hours",    "giờ": "hours",
-        "day": "days",      "ngày": "days",
-        "week": "weeks",    "tuần": "weeks",
+        "second": "seconds",
+        "giây": "seconds",
+        "minute": "minutes",
+        "phút": "minutes",
+        "hour": "hours",
+        "giờ": "hours",
+        "day": "days",
+        "ngày": "days",
+        "week": "weeks",
+        "tuần": "weeks",
     }
     try:
         parts = text_lower.split()
@@ -266,27 +275,38 @@ class ItviecScraper(BaseScraper):
             # Process slugs in page-sized batches so every completed batch is
             # checkpointed immediately via save_batch(). A crash only loses the
             # current batch — the next run resumes from where it left off.
-            BATCH_SIZE = 30
+            BATCH_SIZE = 20
             slug_list = list(new_slugs)
             total_saved = 0
 
             for i in range(0, len(slug_list), BATCH_SIZE):
-                batch_slugs = slug_list[i: i + BATCH_SIZE]
+                batch_slugs = slug_list[i : i + BATCH_SIZE]
                 batch_num = i // BATCH_SIZE + 1
                 self.logger.info(
                     f"Batch {batch_num}: fetching {len(batch_slugs)} jobs "
                     f"({i + 1}–{min(i + BATCH_SIZE, len(slug_list))} of {len(slug_list)})"
                 )
 
+                # Validate URLs before scraping
+                slug_by_url = {f"{LIST_URL}/{slug}": slug for slug in batch_slugs}
+                valid_urls, failures = validate_urls(list(slug_by_url.keys()))
+
+                # Log and save unreachable URLs without crashing the pipeline
+                for failure in failures:
+                    self.save_error_record(failure.to_error_record(self.source_name))
+
+                # Only spawn browser tasks for URLs that are actually alive
                 tasks = [
-                    fetch_detail(browser, f"{LIST_URL}/{slug}", slug, semaphore)
-                    for slug in batch_slugs
+                    fetch_detail(browser, url, slug_by_url[url], semaphore)
+                    for url in valid_urls
                 ]
                 results = await asyncio.gather(*tasks)
 
                 batch_jobs = [
-                    job for job in results
-                    if job.get("title") and self.is_new_job(
+                    job
+                    for job in results
+                    if job.get("title")
+                    and self.is_new_job(
                         job["job_id"], job.get("posted_date", ""), existing
                     )
                 ]
@@ -339,11 +359,18 @@ async def main():
 
 if __name__ == "__main__":
     if sys.platform == "win32":
+
         def custom_unraisablehook(unraisable):
             # Suppress known Python 3.9 Windows ProactorEventLoop cleanup noise
-            if unraisable.exc_type == ValueError and str(unraisable.exc_value) == "I/O operation on closed pipe":
+            if (
+                unraisable.exc_type == ValueError
+                and str(unraisable.exc_value) == "I/O operation on closed pipe"
+            ):
                 return
-            if unraisable.exc_type == RuntimeError and str(unraisable.exc_value) == "Event loop is closed":
+            if (
+                unraisable.exc_type == RuntimeError
+                and str(unraisable.exc_value) == "Event loop is closed"
+            ):
                 return
             sys.__unraisablehook__(unraisable)
 

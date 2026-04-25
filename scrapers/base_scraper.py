@@ -262,6 +262,10 @@ class BaseScraper(abc.ABC):
             "context": context,
             "traceback": traceback.format_exc(),
         }
+        self.save_error_record(record)
+
+    def save_error_record(self, record: dict) -> None:
+        """Save a pre-formatted error dictionary to the shared error Volume."""
         try:
             Path(ERROR_VOLUME).mkdir(parents=True, exist_ok=True)
             date_str = datetime.now().strftime("%Y%m%d")
@@ -269,12 +273,13 @@ class BaseScraper(abc.ABC):
             with open(error_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             self.logger.error(
-                f"[{context}] {type(error).__name__}: {error} — logged to {error_path}"
+                f"[{record.get('context', 'N/A')}] {record.get('error_type', 'Error')}: "
+                f"{record.get('error_msg', '')} — logged to {error_path}"
             )
         except Exception as write_err:
             # Last-resort: if writing to Volume also fails, only log locally
             self.logger.error(f"Failed to write error to volume: {write_err}")
-            self.logger.error(f"Original error — [{context}] {error}")
+            self.logger.error(f"Original error record — {json.dumps(record)}")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Abstract interface
