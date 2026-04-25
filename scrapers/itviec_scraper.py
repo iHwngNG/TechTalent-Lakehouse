@@ -1,5 +1,5 @@
 """
-ITviec Job Crawler — Refactored using BaseScraper & Crawl4AI
+ITviec Job Crawler — ItviecScraper (BaseScraper subclass)
 """
 
 import os
@@ -8,50 +8,57 @@ import asyncio
 import argparse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Any, Set, Tuple
 
 from dotenv import load_dotenv, find_dotenv
 
+# Bootstrap sys.path from .env before any local imports
 load_dotenv(find_dotenv())
-
-# Add project root to sys.path for cross-module imports from .env
-PROJECT_ROOT = os.environ.get("PROJECT_ROOT")
-if PROJECT_ROOT and PROJECT_ROOT not in sys.path:
+PROJECT_ROOT = os.environ.get("PROJECT_ROOT") or str(Path(__file__).resolve().parent.parent)
+if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-elif not PROJECT_ROOT:
-    PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
-    if PROJECT_ROOT not in sys.path:
-        sys.path.insert(0, PROJECT_ROOT)
 
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
-from typing import List, Set, Tuple, Dict
-from urllib.parse import urljoin
-
-from src.validators.bronze.url_validator import validate_urls
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+from playwright.async_api import async_playwright
 
 from scrapers.base_scraper import BaseScraper, async_retry
 
+# ── Constants ──────────────────────────────────────────────────────────────────
+
 BASE_URL = "https://itviec.com"
 LIST_URL = f"{BASE_URL}/it-jobs"
+BATCH_SIZE = 20
+CONCURRENCY = 5
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+# Patches navigator properties before page navigation to avoid bot detection
+STEALTH_JS = """
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    window.chrome = {runtime: {}};
+    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en', 'vi']});
+"""
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def parse_relative_date(text: str) -> str:
-    """Convert relative time string to actual date (YYYY-MM-DD)."""
+    """Convert a relative time string (e.g. '3 days ago') to YYYY-MM-DD."""
     if not text:
         return ""
     text_lower = text.strip().lower()
     unit_map = {
-        "second": "seconds",
-        "giây": "seconds",
-        "minute": "minutes",
-        "phút": "minutes",
-        "hour": "hours",
-        "giờ": "hours",
-        "day": "days",
-        "ngày": "days",
-        "week": "weeks",
-        "tuần": "weeks",
+        "second": "seconds", "giây": "seconds",
+        "minute": "minutes", "phút": "minutes",
+        "hour": "hours",   "giờ": "hours",
+        "day": "days",     "ngày": "days",
+        "week": "weeks",   "tuần": "weeks",
     }
     try:
         parts = text_lower.split()
@@ -76,281 +83,222 @@ def parse_relative_date(text: str) -> str:
         return text
 
 
+# ── Scraper ────────────────────────────────────────────────────────────────────
+
 class ItviecScraper(BaseScraper):
+
     def __init__(self):
         super().__init__(source_name="itviec")
-        load_dotenv()
-        self.browser_config = BrowserConfig(
+        # Crawl4AI config — override_navigator patches before nav (avoids "Target page closed")
+        self._browser_config = BrowserConfig(
             headless=True,
             viewport_width=1920,
             viewport_height=1080,
             cdp_url=os.environ.get("BROWSER_WS_URL"),
             ignore_https_errors=True,
         )
-
-    def _extract_slugs_from_html(self, html: str) -> list:
-        """Extract job slugs from the search results HTML."""
-        soup = BeautifulSoup(html, "html.parser")
-        cards = soup.select("div.job-card")
-        return [
-            card.get("data-search--job-selection-job-slug-value", "").strip()
-            for card in cards
-            if card.get("data-search--job-selection-job-slug-value", "").strip()
-        ]
-
-    def _get_max_pages(self, html: str) -> int:
-        """Auto-detect total number of pages from pagination."""
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            links = soup.select("nav div.page a")
-            max_page = 1
-            for link in links:
-                text = link.get_text(strip=True)
-                if text.isdigit():
-                    max_page = max(max_page, int(text))
-            return max_page
-        except Exception as e:
-            self.logger.warning(f"Could not detect max pages ({e}), defaulting to 1")
-            return 1
-
-    def _extract_detail_from_html(self, html: str, slug: str, url: str) -> dict:
-        """Extract structured job details from the job detail HTML."""
-        soup = BeautifulSoup(html, "html.parser")
-
-        title_el = soup.select_one("h1.job-name, h1[class*='job-name'], h1")
-        title = title_el.get_text(strip=True) if title_el else ""
-
-        company_el = soup.select_one("div.employer-name")
-        company = company_el.get_text(strip=True) if company_el else ""
-
-        salary_el = soup.select_one("a.sign-in-view-salary")
-        salary = salary_el.get_text(strip=True) if salary_el else ""
-
-        info_els = soup.select("span.normal-text.text-rich-grey")
-        locations = info_els[0].get_text(strip=True) if len(info_els) > 0 else ""
-        working_method = info_els[1].get_text(strip=True) if len(info_els) > 1 else ""
-        posted_raw = info_els[2].get_text(strip=True) if len(info_els) > 2 else ""
-        posted_date = parse_relative_date(posted_raw)
-
-        itags = soup.select("a.itag")
-        skills = [tag.get_text(strip=True) for tag in itags]
-
-        desc_el = soup.select_one("section.job-content")
-        description = desc_el.get_text(separator="\n", strip=True) if desc_el else ""
-
-        return {
-            "job_id": f"itviec_{slug}",
-            "title": title,
-            "company": company,
-            "salary": salary,
-            "locations": locations,
-            "working_method": working_method,
-            "skills": skills,
-            "posted_date": posted_date,
-            "description": description,
-            "source": self.source_name,
-            "url": url,
-            "crawled_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-    @async_retry(max_retries=3, base_delay=2.0)
-    async def scrape(self, max_pages: int = 0, existing=None) -> list:
-        """
-        Scrape ITviec job listings.
-
-        existing: set of (job_id, posted_date) tuples from BaseScraper.load_existing_records().
-        Only jobs that pass self.is_new_job() will have their details fetched.
-        """
-        if existing is None:
-            existing = set()
-
-        # Stealth init script — patches navigator BEFORE page navigation
-        stealth_init_js = """
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = {runtime: {}};
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en', 'vi']});
-        """
-
-        # override_navigator=True: patches navigator at context-level BEFORE nav (safe).
-        # Do NOT use magic=True or remove_overlay_elements=True — they run JS
-        # AFTER page load and crash with "Target page closed" on subsequent pages.
-        crawler_config = CrawlerRunConfig(
+        self._crawler_config = CrawlerRunConfig(
             page_timeout=60000,
             wait_for="js:()=>document.querySelector('div.job-card') !== null",
             override_navigator=True,
         )
 
-        async def _fetch_list_page(url: str) -> str:
-            """Spawn a fresh AsyncWebCrawler per page to avoid shared-context crashes."""
-            async with AsyncWebCrawler(config=self.browser_config) as crawler:
-                res = await crawler.arun(url=url, config=crawler_config)
-                return res.html if res.success else ""
+    # ── List page helpers ──────────────────────────────────────────────────────
 
-        # ── Page 1: fetch + detect total pages ───────────────────────────────
-        self.logger.info(f"Fetching page 1 from {LIST_URL}...")
-        html1 = await _fetch_list_page(LIST_URL)
+    def _extract_slugs_from_html(self, html: str) -> list:
+        """Extract job slugs from a listing page."""
+        soup = BeautifulSoup(html, "html.parser")
+        return [
+            card.get("data-search--job-selection-job-slug-value", "").strip()
+            for card in soup.select("div.job-card")
+            if card.get("data-search--job-selection-job-slug-value", "").strip()
+        ]
+
+    def _get_max_pages(self, html: str) -> int:
+        """Auto-detect total pages from pagination links."""
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            pages = [
+                int(a.get_text(strip=True))
+                for a in soup.select("nav div.page a")
+                if a.get_text(strip=True).isdigit()
+            ]
+            return max(pages, default=1)
+        except Exception as e:
+            self.logger.warning(f"Could not detect max pages: {e}")
+            return 1
+
+    async def _fetch_list_page(self, url: str) -> str:
+        """Fetch a listing page HTML using a fresh Crawl4AI context per call."""
+        async with AsyncWebCrawler(config=self._browser_config) as crawler:
+            result = await crawler.arun(url=url, config=self._crawler_config)
+            return result.html if result.success else ""
+
+    async def _collect_all_slugs(self, max_pages: int) -> set:
+        """
+        Fetch all listing pages and return the full set of job slugs.
+
+        Uses a fresh crawler context per page to prevent shared-context crashes.
+        Stops early if a page returns no slugs.
+        """
+        html1 = await self._fetch_list_page(LIST_URL)
         if not html1:
-            raise Exception("Failed to fetch page 1")
+            raise RuntimeError("Failed to fetch listing page 1 — aborting.")
 
-        slugs = self._extract_slugs_from_html(html1)
-        self.logger.info(f"Page 1: Found {len(slugs)} job slugs.")
+        all_slugs = set(self._extract_slugs_from_html(html1))
+        total_pages = self._get_max_pages(html1) if max_pages <= 0 else max_pages
+        self.logger.info(f"Crawling {total_pages} pages. Page 1: {len(all_slugs)} slugs.")
 
-        if max_pages <= 0:
-            max_pages = self._get_max_pages(html1)
-            self.logger.info(f"Auto-detect mode: will crawl all {max_pages} pages")
-        else:
-            self.logger.info(f"Manual mode: will crawl {max_pages} pages")
+        for page in range(2, total_pages + 1):
+            html = await self._fetch_list_page(f"{LIST_URL}?page={page}")
+            if not html:
+                self.logger.warning(f"Page {page}: empty response, stopping early.")
+                break
+            slugs = self._extract_slugs_from_html(html)
+            if not slugs:
+                break
+            all_slugs.update(slugs)
 
-        all_slugs: set = set(slugs)
+        return all_slugs
 
-        # ── Remaining pages: each uses a fresh crawler context ────────────────
-        for page_num in range(2, max_pages + 1):
-            self.logger.info(f"Fetching page {page_num}...")
-            html = await _fetch_list_page(f"{LIST_URL}?page={page_num}")
-            if html:
-                page_slugs = self._extract_slugs_from_html(html)
-                self.logger.info(f"Page {page_num}: Found {len(page_slugs)} job slugs.")
-                if not page_slugs:
-                    break
-                all_slugs.update(page_slugs)
-            else:
-                self.logger.error(f"Failed to fetch page {page_num}")
+    def _build_url_id_map(self, slugs: set) -> dict:
+        """Build {full_url: job_id} mapping for a set of slugs."""
+        return {f"{LIST_URL}/{slug}": f"itviec_{slug}" for slug in slugs}
 
-        # ── Pre-filter by job_id (O(1) set lookup) ───────────────────────────
-        existing_job_ids = {jid for (jid, _) in existing}
-        new_slugs = {
-            slug for slug in all_slugs if f"itviec_{slug}" not in existing_job_ids
+    # ── Detail page ────────────────────────────────────────────────────────────
+
+    def _extract_detail_from_html(self, html: str, slug: str, url: str) -> dict:
+        """Parse job detail HTML into a structured record."""
+        soup = BeautifulSoup(html, "html.parser")
+
+        title_el = soup.select_one("h1.job-name, h1[class*='job-name'], h1")
+        company_el = soup.select_one("div.employer-name")
+        salary_el = soup.select_one("a.sign-in-view-salary")
+        info_els = soup.select("span.normal-text.text-rich-grey")
+        desc_el = soup.select_one("section.job-content")
+
+        return {
+            "job_id": f"itviec_{slug}",
+            "title": title_el.get_text(strip=True) if title_el else "",
+            "company": company_el.get_text(strip=True) if company_el else "",
+            "salary": salary_el.get_text(strip=True) if salary_el else "",
+            "locations": info_els[0].get_text(strip=True) if len(info_els) > 0 else "",
+            "working_method": info_els[1].get_text(strip=True) if len(info_els) > 1 else "",
+            "posted_date": parse_relative_date(
+                info_els[2].get_text(strip=True) if len(info_els) > 2 else ""
+            ),
+            "skills": [tag.get_text(strip=True) for tag in soup.select("a.itag")],
+            "description": desc_el.get_text(separator="\n", strip=True) if desc_el else "",
+            "source": self.source_name,
+            "url": url,
+            "crawled_at": datetime.now(timezone.utc).isoformat(),
         }
-        skipped = len(all_slugs) - len(new_slugs)
-        self.logger.info(
-            f"Total slugs: {len(all_slugs)} | New: {len(new_slugs)} | Skipped (existing): {skipped}"
-        )
 
-        if not new_slugs:
-            self.logger.info("No new jobs to scrape.")
+    async def _fetch_detail_page(
+        self, browser: Any, url: str, identifier: str, semaphore: asyncio.Semaphore
+    ) -> dict:
+        """
+        Fetch and parse a single ITviec job detail page via Playwright CDP.
+
+        Returns {} on any failure so the batch loop can skip gracefully.
+        """
+        async with semaphore:
+            context = await browser.new_context(
+                user_agent=USER_AGENT, ignore_https_errors=True
+            )
+            try:
+                await context.add_init_script(STEALTH_JS)
+                page = await context.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_selector("h1", timeout=30000)
+                html = await page.content()
+                slug = identifier.removeprefix(f"{self.source_name}_")
+                return self._extract_detail_from_html(html, slug, url)
+            except Exception as e:
+                self.logger.error(f"Detail fetch failed [{url}]: {e}")
+                return {}
+            finally:
+                await context.close()
+
+    # ── Main orchestration ─────────────────────────────────────────────────────
+
+    @async_retry(max_retries=3, base_delay=2.0)
+    async def scrape(self, max_pages: int = 0, existing=None) -> list:
+        """
+        Scrape ITviec job listings with incremental, micro-batch checkpointing.
+
+        Phase 1: Collect all job slugs from listing pages.
+        Phase 2: Filter against existing records (skip already-scraped jobs).
+        Phase 3: Fetch details in batches — each batch is checkpointed immediately.
+
+        Args:
+            max_pages : pages to crawl (0 = auto-detect all)
+            existing  : (job_id, posted_date) set from load_existing_records()
+        """
+        if existing is None:
+            existing = set()
+
+        # Phase 1: Collect slugs
+        all_slugs = await self._collect_all_slugs(max_pages)
+        url_id_map = self._build_url_id_map(all_slugs)
+
+        # Phase 2: Filter new jobs
+        new_job_ids, skipped = self._filter_new_ids(set(url_id_map.values()), existing)
+        if not new_job_ids:
+            self.logger.info(f"No new jobs found ({skipped} already exist).")
             return []
 
-        # ── Detail pages via direct Playwright CDP ────────────────────────────
-        cdp_url = os.environ.get("BROWSER_WS_URL", "ws://localhost:3000")
-        self.logger.info(
-            f"Extracting details for {len(new_slugs)} new jobs via Playwright CDP..."
-        )
+        self.logger.info(f"{len(new_job_ids)} new jobs to scrape, {skipped} skipped.")
 
-        async def fetch_detail(
-            pw_browser, url: str, slug: str, semaphore: asyncio.Semaphore
-        ) -> dict:
-            """Fetch a single job detail page with stealth init script applied."""
-            async with semaphore:
-                context = await pw_browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    ignore_https_errors=True,
-                )
-                try:
-                    await context.add_init_script(stealth_init_js)
-                    page = await context.new_page()
-                    self.logger.info(f"Scraping: {url}")
-                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    await page.wait_for_selector("h1", timeout=30000)
-                    html = await page.content()
-                    job = self._extract_detail_from_html(html, slug, url)
-                    self.logger.info(
-                        f"Done: [{job.get('title', 'N/A')}] @ {job.get('company', 'N/A')}"
-                    )
-                    return job
-                except Exception as e:
-                    self.logger.error(f"Failed to fetch {url}: {e}")
-                    return {}
-                finally:
-                    await context.close()
+        # Phase 3: Fetch details in micro-batches
+        new_url_id_map = {url: jid for url, jid in url_id_map.items() if jid in new_job_ids}
+        items = list(new_url_id_map.items())
+        total_saved = 0
+        total_batches = (len(items) + BATCH_SIZE - 1) // BATCH_SIZE
+        cdp_url = os.environ.get("BROWSER_WS_URL", "ws://localhost:3000")
 
         async with async_playwright() as pw:
             browser = await pw.chromium.connect_over_cdp(cdp_url)
-            semaphore = asyncio.Semaphore(5)
+            semaphore = asyncio.Semaphore(CONCURRENCY)
 
-            # Process slugs in page-sized batches so every completed batch is
-            # checkpointed immediately via save_batch(). A crash only loses the
-            # current batch — the next run resumes from where it left off.
-            BATCH_SIZE = 20
-            slug_list = list(new_slugs)
-            total_saved = 0
-
-            for i in range(0, len(slug_list), BATCH_SIZE):
-                batch_slugs = slug_list[i : i + BATCH_SIZE]
+            for i in range(0, len(items), BATCH_SIZE):
+                batch = dict(items[i: i + BATCH_SIZE])
                 batch_num = i // BATCH_SIZE + 1
+                saved = await self._process_batch(browser, batch, semaphore, existing)
+                total_saved += saved
                 self.logger.info(
-                    f"Batch {batch_num}: fetching {len(batch_slugs)} jobs "
-                    f"({i + 1}–{min(i + BATCH_SIZE, len(slug_list))} of {len(slug_list)})"
+                    f"Batch {batch_num}/{total_batches}: saved {saved} jobs "
+                    f"(total: {total_saved})"
                 )
-
-                # Validate URLs before scraping
-                slug_by_url = {f"{LIST_URL}/{slug}": slug for slug in batch_slugs}
-                valid_urls, failures = validate_urls(list(slug_by_url.keys()))
-
-                # Log and save unreachable URLs without crashing the pipeline
-                for failure in failures:
-                    self.save_error_record(failure.to_error_record(self.source_name))
-
-                # Only spawn browser tasks for URLs that are actually alive
-                tasks = [
-                    fetch_detail(browser, url, slug_by_url[url], semaphore)
-                    for url in valid_urls
-                ]
-                results = await asyncio.gather(*tasks)
-
-                batch_jobs = [
-                    job
-                    for job in results
-                    if job.get("title")
-                    and self.is_new_job(
-                        job["job_id"], job.get("posted_date", ""), existing
-                    )
-                ]
-
-                if batch_jobs:
-                    saved = self.save_batch(batch_jobs)  # validate + checkpoint
-                    total_saved += saved
-                    # Update in-memory set so later batches skip these records
-                    for job in batch_jobs:
-                        existing.add((job["job_id"], job.get("posted_date", "")))
-                    self.logger.info(
-                        f"Batch {batch_num}: checkpointed {saved} jobs "
-                        f"(total so far: {total_saved})"
-                    )
 
             await browser.close()
 
-        self.logger.info(f"Scrape complete. Total new jobs saved: {total_saved}")
-        # Return empty list — micro-batching already persisted everything above
+        self.logger.info(f"Scrape complete — {total_saved} new jobs saved.")
         return []
 
 
+# ── Entry point ────────────────────────────────────────────────────────────────
+
 async def main():
-    parser = argparse.ArgumentParser(description="ITviec Crawler (OOP + Crawl4AI)")
+    parser = argparse.ArgumentParser(description="ITviec Job Scraper")
     parser.add_argument(
-        "--pages", type=int, default=0, help="Number of pages to crawl (0 = all pages)"
+        "--pages", type=int, default=0,
+        help="Number of list pages to crawl (0 = all)"
     )
     args = parser.parse_args()
 
     scraper = ItviecScraper()
 
     try:
-        scraper.logger.info(f"Loading existing records from: {scraper.volume_dir}")
         existing = scraper.load_existing_records()
-        scraper.logger.info(f"Found {len(existing)} existing records.")
-
-        # scrape() now handles micro-batch checkpointing internally via save_batch()
+        scraper.logger.info(
+            f"Loaded {len(existing)} existing records from {scraper.volume_dir}"
+        )
         await scraper.scrape(max_pages=args.pages, existing=existing)
 
     except Exception as e:
-        # Write structured error to /Volumes/workspace/techtalent_lakehouse/error/
-        # so Databricks Jobs can keep running while errors are queryable via Spark SQL.
-        scraper.save_error(e, context="main_pipeline")
-        raise  # Re-raise so Databricks marks the Job run as FAILED
+        scraper.save_error(e, context="main")
+        raise  # Re-raise so Databricks marks the Job as FAILED
 
     finally:
         if sys.platform == "win32":
@@ -359,21 +307,13 @@ async def main():
 
 if __name__ == "__main__":
     if sys.platform == "win32":
-
-        def custom_unraisablehook(unraisable):
-            # Suppress known Python 3.9 Windows ProactorEventLoop cleanup noise
-            if (
-                unraisable.exc_type == ValueError
-                and str(unraisable.exc_value) == "I/O operation on closed pipe"
-            ):
-                return
-            if (
-                unraisable.exc_type == RuntimeError
-                and str(unraisable.exc_value) == "Event loop is closed"
-            ):
+        def _suppress_win32_cleanup(unraisable):
+            # Suppress known Python 3.9 Windows ProactorEventLoop noise
+            msg = str(unraisable.exc_value)
+            if msg in ("I/O operation on closed pipe", "Event loop is closed"):
                 return
             sys.__unraisablehook__(unraisable)
 
-        sys.unraisablehook = custom_unraisablehook
+        sys.unraisablehook = _suppress_win32_cleanup
 
     asyncio.run(main())
