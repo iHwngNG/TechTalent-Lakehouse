@@ -8,13 +8,15 @@ import asyncio
 import argparse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Set, Tuple
+from typing import Any
 
 from dotenv import load_dotenv, find_dotenv
 
 # Bootstrap sys.path from .env before any local imports
 load_dotenv(find_dotenv())
-PROJECT_ROOT = os.environ.get("PROJECT_ROOT") or str(Path(__file__).resolve().parent.parent)
+PROJECT_ROOT = os.environ.get("PROJECT_ROOT") or str(
+    Path(__file__).resolve().parent.parent
+)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -48,17 +50,23 @@ STEALTH_JS = """
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+
 def parse_relative_date(text: str) -> str:
     """Convert a relative time string (e.g. '3 days ago') to YYYY-MM-DD."""
     if not text:
         return ""
     text_lower = text.strip().lower()
     unit_map = {
-        "second": "seconds", "giây": "seconds",
-        "minute": "minutes", "phút": "minutes",
-        "hour": "hours",   "giờ": "hours",
-        "day": "days",     "ngày": "days",
-        "week": "weeks",   "tuần": "weeks",
+        "second": "seconds",
+        "giây": "seconds",
+        "minute": "minutes",
+        "phút": "minutes",
+        "hour": "hours",
+        "giờ": "hours",
+        "day": "days",
+        "ngày": "days",
+        "week": "weeks",
+        "tuần": "weeks",
     }
     try:
         parts = text_lower.split()
@@ -84,6 +92,7 @@ def parse_relative_date(text: str) -> str:
 
 
 # ── Scraper ────────────────────────────────────────────────────────────────────
+
 
 class ItviecScraper(BaseScraper):
 
@@ -147,7 +156,9 @@ class ItviecScraper(BaseScraper):
 
         all_slugs = set(self._extract_slugs_from_html(html1))
         total_pages = self._get_max_pages(html1) if max_pages <= 0 else max_pages
-        self.logger.info(f"Crawling {total_pages} pages. Page 1: {len(all_slugs)} slugs.")
+        self.logger.info(
+            f"Crawling {total_pages} pages. Page 1: {len(all_slugs)} slugs."
+        )
 
         for page in range(2, total_pages + 1):
             html = await self._fetch_list_page(f"{LIST_URL}?page={page}")
@@ -183,12 +194,16 @@ class ItviecScraper(BaseScraper):
             "company": company_el.get_text(strip=True) if company_el else "",
             "salary": salary_el.get_text(strip=True) if salary_el else "",
             "locations": info_els[0].get_text(strip=True) if len(info_els) > 0 else "",
-            "working_method": info_els[1].get_text(strip=True) if len(info_els) > 1 else "",
+            "working_method": (
+                info_els[1].get_text(strip=True) if len(info_els) > 1 else ""
+            ),
             "posted_date": parse_relative_date(
                 info_els[2].get_text(strip=True) if len(info_els) > 2 else ""
             ),
             "skills": [tag.get_text(strip=True) for tag in soup.select("a.itag")],
-            "description": desc_el.get_text(separator="\n", strip=True) if desc_el else "",
+            "description": (
+                desc_el.get_text(separator="\n", strip=True) if desc_el else ""
+            ),
             "source": self.source_name,
             "url": url,
             "crawled_at": datetime.now(timezone.utc).isoformat(),
@@ -251,7 +266,9 @@ class ItviecScraper(BaseScraper):
         self.logger.info(f"{len(new_job_ids)} new jobs to scrape, {skipped} skipped.")
 
         # Phase 3: Fetch details in micro-batches
-        new_url_id_map = {url: jid for url, jid in url_id_map.items() if jid in new_job_ids}
+        new_url_id_map = {
+            url: jid for url, jid in url_id_map.items() if jid in new_job_ids
+        }
         items = list(new_url_id_map.items())
         total_saved = 0
         total_batches = (len(items) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -262,7 +279,7 @@ class ItviecScraper(BaseScraper):
             semaphore = asyncio.Semaphore(CONCURRENCY)
 
             for i in range(0, len(items), BATCH_SIZE):
-                batch = dict(items[i: i + BATCH_SIZE])
+                batch = dict(items[i : i + BATCH_SIZE])
                 batch_num = i // BATCH_SIZE + 1
                 saved = await self._process_batch(browser, batch, semaphore, existing)
                 total_saved += saved
@@ -279,11 +296,11 @@ class ItviecScraper(BaseScraper):
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+
 async def main():
     parser = argparse.ArgumentParser(description="ITviec Job Scraper")
     parser.add_argument(
-        "--pages", type=int, default=0,
-        help="Number of list pages to crawl (0 = all)"
+        "--pages", type=int, default=0, help="Number of list pages to crawl (0 = all)"
     )
     args = parser.parse_args()
 
@@ -307,6 +324,7 @@ async def main():
 
 if __name__ == "__main__":
     if sys.platform == "win32":
+
         def _suppress_win32_cleanup(unraisable):
             # Suppress known Python 3.9 Windows ProactorEventLoop noise
             msg = str(unraisable.exc_value)

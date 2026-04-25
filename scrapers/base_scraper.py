@@ -23,6 +23,16 @@ VOLUME_BASE = "/Volumes/workspace/techtalent_lakehouse/raws"
 ERROR_VOLUME = "/Volumes/workspace/techtalent_lakehouse/error"
 
 
+# ── Custom exceptions ──────────────────────────────────────────────────────────
+
+class BrowserDisconnectedError(RuntimeError):
+    """Raised when the remote Playwright browser/CDP connection is lost."""
+
+
+class AntiBotDetectedError(RuntimeError):
+    """Raised when a fetched page is an anti-bot / Cloudflare challenge page."""
+
+
 def retry(max_retries=3, base_delay=2.0):
     """Retry decorator with exponential backoff for synchronous functions."""
     def decorator(func):
@@ -153,41 +163,55 @@ class BaseScraper(abc.ABC):
         """
         Validate URLs → fetch details concurrently → validate quality → checkpoint.
 
-        Args:
-            browser    : Playwright browser instance (connected via CDP)
-            url_id_map : {url: job_id} mapping for this batch
-            semaphore  : controls max concurrent browser contexts
-            existing   : in-memory set, updated in-place after each save
+        Uses return_exceptions=True so one failing task never cancels the others.
+        BrowserDisconnectedError and AntiBotDetectedError are surfaced once and
+        re-raised / swallowed respectively — DataQualityError is never triggered
+        by connection or bot-block failures.
 
         Returns:
-            Number of records saved (0 if nothing new or quality check fails).
+            Number of records saved.
         """
         # Step 1: Drop unreachable URLs before opening browser contexts
         valid_urls, failures = validate_urls(list(url_id_map.keys()))
         for failure in failures:
             self.save_error_record(failure.to_error_record(self.source_name))
-
         if not valid_urls:
             return 0
 
-        # Step 2: Fetch detail pages concurrently
+        # Step 2: Fetch concurrently — exceptions are returned as values, not raised
         tasks = [
             self._fetch_detail_page(browser, url, url_id_map[url], semaphore)
             for url in valid_urls
         ]
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Step 3: Keep only valid, new records
+        # Step 3a: Browser disconnect — log once and re-raise to break the batch loop
+        disconnect = next(
+            (r for r in results if isinstance(r, BrowserDisconnectedError)), None
+        )
+        if disconnect:
+            self.save_error(disconnect, context="browser_connection")
+            raise disconnect
+
+        # Step 3b: Anti-bot block — log once and skip batch (not a data quality issue)
+        antibot = next(
+            (r for r in results if isinstance(r, AntiBotDetectedError)), None
+        )
+        if antibot:
+            self.save_error(antibot, context="antibot_detection")
+            return 0
+
+        # Step 4: Keep only successful dict results for new, valid jobs
         batch_jobs = [
             job for job in results
-            if job.get("title") and self.is_new_job(
-                job["job_id"], job.get("posted_date", ""), existing
-            )
+            if isinstance(job, dict)
+            and job.get("title")
+            and self.is_new_job(job["job_id"], job.get("posted_date", ""), existing)
         ]
         if not batch_jobs:
             return 0
 
-        # Step 4: Quality gate + append to Volume (atomic checkpoint)
+        # Step 5: Quality gate + atomic Volume checkpoint
         saved = self.save_batch(batch_jobs)
 
         # Step 5: Update in-memory set so later batches skip these
