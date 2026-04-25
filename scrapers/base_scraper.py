@@ -1,4 +1,5 @@
 import abc
+import asyncio
 import time
 import json
 import os
@@ -9,30 +10,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Set, Tuple
 
-from src.validators.bronze.data_quality_validator import (
-    validate_bronze_data,
-    DQ_EMPTY_THRESHOLD,
-)
+from src.validators.bronze.data_quality_validator import validate_bronze_data, DQ_EMPTY_THRESHOLD
+from src.validators.bronze.url_validator import validate_urls
 
-# Structured logging configuration
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-# Base Databricks Volume path — each scraper writes to its own subdirectory
 VOLUME_BASE = "/Volumes/workspace/techtalent_lakehouse/raws"
-
-# Centralized error log — all scrapers share one daily file
 ERROR_VOLUME = "/Volumes/workspace/techtalent_lakehouse/error"
-
-# Structured logging configuration
 
 
 def retry(max_retries=3, base_delay=2.0):
     """Retry decorator with exponential backoff for synchronous functions."""
-
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -43,27 +35,19 @@ def retry(max_retries=3, base_delay=2.0):
                 except Exception as e:
                     retries += 1
                     if retries == max_retries:
-                        logging.error(f"Failed after {max_retries} retries: {e}")
                         raise
                     delay = base_delay * (2 ** (retries - 1))
-                    logging.warning(
-                        f"Error occurred: {e}. Retrying {retries}/{max_retries} in {delay}s..."
-                    )
+                    logging.warning(f"Retry {retries}/{max_retries} in {delay}s: {e}")
                     time.sleep(delay)
-
         return wrapper
-
     return decorator
 
 
 def async_retry(max_retries=3, base_delay=2.0):
     """Retry decorator with exponential backoff for asynchronous functions."""
-
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            import asyncio
-
             retries = 0
             while retries < max_retries:
                 try:
@@ -71,50 +55,38 @@ def async_retry(max_retries=3, base_delay=2.0):
                 except Exception as e:
                     retries += 1
                     if retries == max_retries:
-                        logging.error(f"Failed after {max_retries} retries: {e}")
                         raise
                     delay = base_delay * (2 ** (retries - 1))
-                    logging.warning(
-                        f"Error occurred: {e}. Retrying {retries}/{max_retries} in {delay}s..."
-                    )
+                    logging.warning(f"Retry {retries}/{max_retries} in {delay}s: {e}")
                     await asyncio.sleep(delay)
-
         return wrapper
-
     return decorator
 
 
 class BaseScraper(abc.ABC):
     """
-    Abstract base class defining the common interface for all scrapers.
+    Abstract base class for all scrapers.
 
-    Provides shared logic for:
-    - Incremental scraping: load existing (job_id, posted_date) pairs from the
-      Volume directory so child scrapers can skip already-known jobs.
-    - Micro-batch persistence: validate + append each page-worth of records
-      immediately via save_batch(), so a crash only loses the current page.
-    - Centralized error logging to a shared Volume path.
+    Provides:
+    - Incremental scraping via load_existing_records() + is_new_job().
+    - Generic _filter_new_ids() and _process_batch() for reuse across all child scrapers.
+    - Micro-batch checkpointing via save_batch() (validate + append atomically).
+    - Centralized error logging to the shared Databricks error Volume.
+
+    Child scrapers must implement:
+    - scrape()             : top-level orchestration
+    - _fetch_detail_page() : website-specific page fetching & parsing
     """
 
     def __init__(self, source_name: str):
         self.source_name = source_name
         self.logger = logging.getLogger(self.__class__.__name__)
-        # Each scraper writes to its own sub-folder inside the volume
         self.volume_dir = os.path.join(VOLUME_BASE, source_name)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Incremental scraping helpers
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── Incremental scraping ───────────────────────────────────────────────────
 
     def load_existing_records(self) -> Set[Tuple[str, str]]:
-        """
-        Scan all JSONL files in the scraper's volume directory and return a set
-        of (job_id, posted_date) tuples representing already-scraped jobs.
-
-        A job is considered 'new' only when its job_id has never been seen OR
-        when its posted_date has changed (e.g. a repost).
-        Returns an empty set when the directory does not exist yet.
-        """
+        """Return a set of (job_id, posted_date) tuples from all JSONL files in volume."""
         existing: Set[Tuple[str, str]] = set()
         vol_path = Path(self.volume_dir)
         if not vol_path.exists():
@@ -129,32 +101,102 @@ class BaseScraper(abc.ABC):
                             continue
                         record = json.loads(line)
                         job_id = record.get("job_id", "")
-                        posted_date = record.get("posted_date", "")
                         if job_id:
-                            existing.add((job_id, posted_date))
+                            existing.add((job_id, record.get("posted_date", "")))
             except Exception as e:
-                self.logger.warning(f"Could not read {jsonl_file}: {e}")
+                self.logger.warning(f"Skipping unreadable file {jsonl_file.name}: {e}")
 
         return existing
 
-    def is_new_job(
-        self, job_id: str, posted_date: str, existing: Set[Tuple[str, str]]
-    ) -> bool:
-        """
-        Return True if the job should be scraped.
-        A job is new if:
-          - Its job_id has never been seen, OR
-          - Its job_id exists but with a different posted_date (re-posted job).
-        """
-        # Collect all known posted_dates for this job_id
+    def is_new_job(self, job_id: str, posted_date: str, existing: Set[Tuple[str, str]]) -> bool:
+        """Return True if this (job_id, posted_date) pair has not been scraped before."""
         known_dates = {pd for (jid, pd) in existing if jid == job_id}
-        if not known_dates:
-            return True  # Never seen before
-        return posted_date not in known_dates  # Re-posted with a different date
+        return not known_dates or posted_date not in known_dates
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Persistence
-    # ──────────────────────────────────────────────────────────────────────────
+    def _filter_new_ids(self, all_ids: set, existing: Set[Tuple[str, str]]) -> Tuple[set, int]:
+        """
+        Filter a set of job IDs against the existing records.
+
+        Returns:
+            (new_ids, skipped_count)
+        """
+        known_ids = {jid for (jid, _) in existing}
+        new_ids = all_ids - known_ids
+        return new_ids, len(all_ids) - len(new_ids)
+
+    # ── Abstract interface ─────────────────────────────────────────────────────
+
+    @abc.abstractmethod
+    async def scrape(self, *args, **kwargs) -> list:
+        """Top-level scraping orchestration. Must be implemented by each child."""
+
+    @abc.abstractmethod
+    async def _fetch_detail_page(
+        self, browser: Any, url: str, identifier: str, semaphore: asyncio.Semaphore
+    ) -> dict:
+        """
+        Fetch and parse a single detail page.
+
+        Returns a dict with at minimum: job_id, title, company, posted_date.
+        Return {} on any failure — the batch loop will skip empty results.
+        """
+
+    # ── Shared batch orchestration ─────────────────────────────────────────────
+
+    async def _process_batch(
+        self,
+        browser: Any,
+        url_id_map: dict,
+        semaphore: asyncio.Semaphore,
+        existing: Set[Tuple[str, str]],
+    ) -> int:
+        """
+        Validate URLs → fetch details concurrently → validate quality → checkpoint.
+
+        Args:
+            browser    : Playwright browser instance (connected via CDP)
+            url_id_map : {url: job_id} mapping for this batch
+            semaphore  : controls max concurrent browser contexts
+            existing   : in-memory set, updated in-place after each save
+
+        Returns:
+            Number of records saved (0 if nothing new or quality check fails).
+        """
+        # Step 1: Drop unreachable URLs before opening browser contexts
+        valid_urls, failures = validate_urls(list(url_id_map.keys()))
+        for failure in failures:
+            self.save_error_record(failure.to_error_record(self.source_name))
+
+        if not valid_urls:
+            return 0
+
+        # Step 2: Fetch detail pages concurrently
+        tasks = [
+            self._fetch_detail_page(browser, url, url_id_map[url], semaphore)
+            for url in valid_urls
+        ]
+        results = await asyncio.gather(*tasks)
+
+        # Step 3: Keep only valid, new records
+        batch_jobs = [
+            job for job in results
+            if job.get("title") and self.is_new_job(
+                job["job_id"], job.get("posted_date", ""), existing
+            )
+        ]
+        if not batch_jobs:
+            return 0
+
+        # Step 4: Quality gate + append to Volume (atomic checkpoint)
+        saved = self.save_batch(batch_jobs)
+
+        # Step 5: Update in-memory set so later batches skip these
+        for job in batch_jobs:
+            existing.add((job["job_id"], job.get("posted_date", "")))
+
+        return saved
+
+    # ── Persistence ────────────────────────────────────────────────────────────
 
     def validate_quality(
         self,
@@ -162,9 +204,7 @@ class BaseScraper(abc.ABC):
         critical_fields: tuple = ("title", "company"),
         threshold: float = DQ_EMPTY_THRESHOLD,
     ) -> None:
-        """
-        Data Quality Gate — delegates to the centralized bronze layer validator.
-        """
+        """Data quality gate — delegates to the bronze layer validator."""
         validate_bronze_data(
             data=data,
             source_name=self.source_name,
@@ -172,30 +212,8 @@ class BaseScraper(abc.ABC):
             threshold=threshold,
         )
 
-    def save_batch(
-        self,
-        batch: list,
-        critical_fields: tuple = ("title", "company"),
-    ) -> int:
-        """
-        Micro-batch checkpoint: validate quality then immediately append to Volume.
-
-        Call this once per page inside the scraping loop instead of accumulating
-        all results in memory. If the pipeline crashes mid-run, every batch
-        written before the crash is preserved — the next run will skip those
-        records via load_existing_records().
-
-        Args:
-            batch           : list of job dicts from a single page
-            critical_fields : fields checked by the quality gate
-
-        Returns:
-            Number of records saved (0 if batch is empty or fails quality gate).
-
-        Raises:
-            DataQualityError: propagated from validate_quality() when the
-                              website DOM has changed and data is mostly empty.
-        """
+    def save_batch(self, batch: list, critical_fields: tuple = ("title", "company")) -> int:
+        """Validate quality then immediately append batch to Volume (micro-batch checkpoint)."""
         if not batch:
             return 0
         self.validate_quality(batch, critical_fields=critical_fields)
@@ -203,57 +221,34 @@ class BaseScraper(abc.ABC):
         return len(batch)
 
     def save_to_volume(self, data: list) -> str:
-        """
-        Append new job records to the scraper's daily JSONL file inside the
-        Databricks Unity Catalog Volume directory.
-        Returns the full path of the written file, or '' if nothing was saved.
-        """
+        """Append records to the scraper's daily JSONL file in the Databricks Volume."""
         if not data:
-            self.logger.warning("No data to save.")
             return ""
 
         Path(self.volume_dir).mkdir(parents=True, exist_ok=True)
         date_str = datetime.now().strftime("%Y%m%d")
-        output_path = os.path.join(
-            self.volume_dir, f"{self.source_name}_{date_str}.jsonl"
-        )
+        output_path = os.path.join(self.volume_dir, f"{self.source_name}_{date_str}.jsonl")
 
         with open(output_path, "a", encoding="utf-8") as f:
             for item in data:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-        self.logger.info(f"Saved {len(data)} records to {output_path}")
+        self.logger.info(f"Saved {len(data)} records → {output_path}")
         return output_path
 
     def save(self, data: list, output_path: str) -> None:
         """Save data as JSONL to an arbitrary local path (for development/testing)."""
         if not data:
-            self.logger.warning("No data to save.")
             return
-
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
             for item in data:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
-        self.logger.info(f"Saved {len(data)} records to {output_path}")
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Error logging
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── Error logging ──────────────────────────────────────────────────────────
 
     def save_error(self, error: Exception, context: str = "") -> None:
-        """
-        Append a structured error record to the shared daily error JSONL file
-        in the Databricks Volume at /Volumes/workspace/techtalent_lakehouse/error/.
-
-        Schema (minimal, queryable by Spark):
-            timestamp   : ISO-8601 UTC string
-            source      : scraper name (e.g. 'itviec')
-            error_type  : exception class name
-            error_msg   : short error message
-            context     : where in the pipeline the error occurred
-            traceback   : full stack trace for debugging
-        """
+        """Build a standard error record from an exception and persist it."""
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "source": self.source_name,
@@ -265,7 +260,7 @@ class BaseScraper(abc.ABC):
         self.save_error_record(record)
 
     def save_error_record(self, record: dict) -> None:
-        """Save a pre-formatted error dictionary to the shared error Volume."""
+        """Append a pre-formatted error dict to the shared daily error JSONL Volume."""
         try:
             Path(ERROR_VOLUME).mkdir(parents=True, exist_ok=True)
             date_str = datetime.now().strftime("%Y%m%d")
@@ -273,23 +268,8 @@ class BaseScraper(abc.ABC):
             with open(error_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             self.logger.error(
-                f"[{record.get('context', 'N/A')}] {record.get('error_type', 'Error')}: "
-                f"{record.get('error_msg', '')} — logged to {error_path}"
+                f"[{record.get('context')}] {record.get('error_type')}: {record.get('error_msg')}"
             )
         except Exception as write_err:
-            # Last-resort: if writing to Volume also fails, only log locally
             self.logger.error(f"Failed to write error to volume: {write_err}")
-            self.logger.error(f"Original error record — {json.dumps(record)}")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Abstract interface
-    # ──────────────────────────────────────────────────────────────────────────
-
-    @abc.abstractmethod
-    async def scrape(self, *args, **kwargs) -> Any:
-        """
-        Core scraping function — must be implemented by each child scraper.
-        Should accept an `existing` parameter (Set[Tuple[str,str]]) and use
-        self.is_new_job() to filter out already-scraped records.
-        """
-        pass
+            self.logger.error(f"Original record: {json.dumps(record)}")
