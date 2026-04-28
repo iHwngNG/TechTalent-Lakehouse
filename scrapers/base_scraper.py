@@ -10,7 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Set, Tuple
 
-from src.validators.bronze.data_quality_validator import validate_bronze_data, DQ_EMPTY_THRESHOLD
+from src.validators.bronze.data_quality_validator import (
+    validate_bronze_data,
+    DQ_EMPTY_THRESHOLD,
+)
 from src.validators.bronze.url_validator import validate_urls
 
 logging.basicConfig(
@@ -25,6 +28,7 @@ ERROR_VOLUME = "/Volumes/workspace/techtalent_lakehouse/error"
 
 # ── Custom exceptions ──────────────────────────────────────────────────────────
 
+
 class BrowserDisconnectedError(RuntimeError):
     """Raised when the remote Playwright browser/CDP connection is lost."""
 
@@ -35,6 +39,7 @@ class AntiBotDetectedError(RuntimeError):
 
 def retry(max_retries=3, base_delay=2.0):
     """Retry decorator with exponential backoff for synchronous functions."""
+
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -49,12 +54,15 @@ def retry(max_retries=3, base_delay=2.0):
                     delay = base_delay * (2 ** (retries - 1))
                     logging.warning(f"Retry {retries}/{max_retries} in {delay}s: {e}")
                     time.sleep(delay)
+
         return wrapper
+
     return decorator
 
 
 def async_retry(max_retries=3, base_delay=2.0):
     """Retry decorator with exponential backoff for asynchronous functions."""
+
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
@@ -69,7 +77,9 @@ def async_retry(max_retries=3, base_delay=2.0):
                     delay = base_delay * (2 ** (retries - 1))
                     logging.warning(f"Retry {retries}/{max_retries} in {delay}s: {e}")
                     await asyncio.sleep(delay)
+
         return wrapper
+
     return decorator
 
 
@@ -96,34 +106,74 @@ class BaseScraper(abc.ABC):
     # ── Incremental scraping ───────────────────────────────────────────────────
 
     def load_existing_records(self) -> Set[Tuple[str, str]]:
-        """Return a set of (job_id, posted_date) tuples from all JSONL files in volume."""
+        """
+        Query the Silver Delta table for existing (job_id, posted_date) pairs.
+
+        This avoids reading raw JSONL files entirely, which would cause memory
+        bloat as the data lake grows. Falls back to an empty set gracefully.
+        """
         existing: Set[Tuple[str, str]] = set()
-        vol_path = Path(self.volume_dir)
-        if not vol_path.exists():
+        table = f"workspace.techtalent_lakehouse.silver_{self.source_name}_jobs"
+
+        host = os.environ.get("DATABRICKS_HOST", "").strip()
+        token = os.environ.get("DATABRICKS_TOKEN", "").strip()
+        http_path = os.environ.get("DATABRICKS_HTTP_PATH", "").strip()
+
+        if not all([host, token, http_path]):
+            self.logger.warning(
+                "Databricks credentials not fully set — starting with empty existing set."
+            )
             return existing
 
-        for jsonl_file in sorted(vol_path.glob("*.jsonl")):
-            try:
-                with open(jsonl_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        record = json.loads(line)
-                        job_id = record.get("job_id", "")
+        try:
+            from databricks import sql as dbsql
+
+            with dbsql.connect(
+                server_hostname=host.removeprefix("https://"),
+                http_path=http_path,
+                access_token=token,
+            ) as conn:
+                with conn.cursor() as cursor:
+                    # Cost Optimization: Only query the last 30 days.
+                    query = f"""
+                        SELECT DISTINCT job_id, posted_date 
+                        FROM {table}
+                        WHERE crawled_at >= current_date() - INTERVAL 30 DAYS
+                    """
+                    cursor.execute(query)
+                    for row in cursor.fetchall():
+                        job_id = row[0] or ""
+                        posted_date = str(row[1] or "")
                         if job_id:
-                            existing.add((job_id, record.get("posted_date", "")))
-            except Exception as e:
-                self.logger.warning(f"Skipping unreadable file {jsonl_file.name}: {e}")
+                            existing.add((job_id, posted_date))
+
+            self.logger.info(
+                f"Loaded {len(existing)} existing records from Silver table '{table}'."
+            )
+
+        except Exception as e:
+            err = str(e)
+            if "TABLE_OR_VIEW_NOT_FOUND" in err or "does not exist" in err.lower():
+                self.logger.info(
+                    f"Silver table '{table}' not found — starting fresh (first run)."
+                )
+            else:
+                self.logger.warning(
+                    f"Could not load existing records from Silver: {e} — starting fresh."
+                )
 
         return existing
 
-    def is_new_job(self, job_id: str, posted_date: str, existing: Set[Tuple[str, str]]) -> bool:
+    def is_new_job(
+        self, job_id: str, posted_date: str, existing: Set[Tuple[str, str]]
+    ) -> bool:
         """Return True if this (job_id, posted_date) pair has not been scraped before."""
         known_dates = {pd for (jid, pd) in existing if jid == job_id}
         return not known_dates or posted_date not in known_dates
 
-    def _filter_new_ids(self, all_ids: set, existing: Set[Tuple[str, str]]) -> Tuple[set, int]:
+    def _filter_new_ids(
+        self, all_ids: set, existing: Set[Tuple[str, str]]
+    ) -> Tuple[set, int]:
         """
         Filter a set of job IDs against the existing records.
 
@@ -163,58 +213,57 @@ class BaseScraper(abc.ABC):
         """
         Validate URLs → fetch details concurrently → validate quality → checkpoint.
 
-        Uses return_exceptions=True so one failing task never cancels the others.
-        BrowserDisconnectedError and AntiBotDetectedError are surfaced once and
-        re-raised / swallowed respectively — DataQualityError is never triggered
-        by connection or bot-block failures.
+        Args:
+            browser    : Playwright browser instance (connected via CDP)
+            url_id_map : {url: job_id} mapping for this batch
+            semaphore  : controls max concurrent browser contexts
+            existing   : in-memory set, updated in-place after each save
 
         Returns:
-            Number of records saved.
+            Number of records saved (0 if nothing new or quality check fails).
         """
-        # Step 1: Drop unreachable URLs before opening browser contexts
-        valid_urls, failures = validate_urls(list(url_id_map.keys()))
-        for failure in failures:
-            self.save_error_record(failure.to_error_record(self.source_name))
+        # Step 1: Drop unreachable URLs before opening browser contexts (if enabled)
+        if getattr(self, "_validate_urls", True):
+            valid_urls, failures = validate_urls(list(url_id_map.keys()))
+            for failure in failures:
+                self.save_error_record(failure.to_error_record(self.source_name))
+        else:
+            valid_urls = list(url_id_map.keys())
+
         if not valid_urls:
             return 0
 
-        # Step 2: Fetch concurrently — exceptions are returned as values, not raised
+        # Step 2: Fetch detail pages concurrently
         tasks = [
             self._fetch_detail_page(browser, url, url_id_map[url], semaphore)
             for url in valid_urls
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Step 3a: Browser disconnect — log once and re-raise to break the batch loop
-        disconnect = next(
-            (r for r in results if isinstance(r, BrowserDisconnectedError)), None
-        )
-        if disconnect:
-            self.save_error(disconnect, context="browser_connection")
-            raise disconnect
+        # Step 3: Handle critical errors and collect valid jobs
+        batch_jobs = []
+        for i, result in enumerate(results):
+            url = valid_urls[i]
+            if isinstance(result, BrowserDisconnectedError):
+                self.logger.error(f"Browser disconnected during fetch of {url}")
+                raise result  # Escalating to trigger batch-level reconnection
+            elif isinstance(result, AntiBotDetectedError):
+                self.logger.warning(f"Anti-bot detected at {url} - skipping")
+                continue
+            elif isinstance(result, Exception):
+                self.logger.error(f"Unexpected error fetching {url}: {result}")
+                continue
+            elif result and isinstance(result, dict) and result.get("title"):
+                if self.is_new_job(result["job_id"], result.get("posted_date", ""), existing):
+                    batch_jobs.append(result)
 
-        # Step 3b: Anti-bot block — log once and skip batch (not a data quality issue)
-        antibot = next(
-            (r for r in results if isinstance(r, AntiBotDetectedError)), None
-        )
-        if antibot:
-            self.save_error(antibot, context="antibot_detection")
-            return 0
-
-        # Step 4: Keep only successful dict results for new, valid jobs
-        batch_jobs = [
-            job for job in results
-            if isinstance(job, dict)
-            and job.get("title")
-            and self.is_new_job(job["job_id"], job.get("posted_date", ""), existing)
-        ]
         if not batch_jobs:
             return 0
 
-        # Step 5: Quality gate + atomic Volume checkpoint
+        # Step 4: Quality gate + append to Volume (atomic checkpoint)
         saved = self.save_batch(batch_jobs)
 
-        # Step 5: Update in-memory set so later batches skip these
+        # Step 5: Update in-memory set
         for job in batch_jobs:
             existing.add((job["job_id"], job.get("posted_date", "")))
 
@@ -236,7 +285,9 @@ class BaseScraper(abc.ABC):
             threshold=threshold,
         )
 
-    def save_batch(self, batch: list, critical_fields: tuple = ("title", "company")) -> int:
+    def save_batch(
+        self, batch: list, critical_fields: tuple = ("title", "company")
+    ) -> int:
         """Validate quality then immediately append batch to Volume (micro-batch checkpoint)."""
         if not batch:
             return 0
@@ -251,7 +302,9 @@ class BaseScraper(abc.ABC):
 
         Path(self.volume_dir).mkdir(parents=True, exist_ok=True)
         date_str = datetime.now().strftime("%Y%m%d")
-        output_path = os.path.join(self.volume_dir, f"{self.source_name}_{date_str}.jsonl")
+        output_path = os.path.join(
+            self.volume_dir, f"{self.source_name}_{date_str}.jsonl"
+        )
 
         with open(output_path, "a", encoding="utf-8") as f:
             for item in data:
