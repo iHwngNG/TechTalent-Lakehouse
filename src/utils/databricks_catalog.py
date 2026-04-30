@@ -53,15 +53,51 @@ def ensure_volume_exists(
 
 
 def bootstrap_volumes() -> None:
-    """
-    Idempotent bootstrap: ensure all required Databricks volumes exist.
-    Call this once at the start of a Databricks Job before any scraper runs.
-
-    Volumes created under workspace.techtalent_lakehouse:
-        - raws  : raw JSONL files per scraper
-        - error : centralized error log (all scrapers share one daily file)
-    """
-    ensure_schema_exists()
-    for vol in ("raws", "error"):
+    for vol in ("raws", "error", "silver"):
         ensure_volume_exists(volume_name=vol)
     logger.info("All required volumes are ready.")
+
+
+def ensure_fact_jobs_table_exists(spark) -> None:
+    """
+    Kiểm tra và tạo table fact_jobs (định dạng Delta) trong Volume silver nếu chưa có.
+    Yêu cầu truyền vào đối tượng SparkSession (spark).
+    """
+    from pyspark.sql.types import StructType, StructField, StringType, DateType, ArrayType, TimestampType
+
+    table_path = f"/Volumes/{CATALOG}/{SCHEMA}/silver/fact_jobs"
+    
+    try:
+        # Thử đọc để xem Delta table đã tồn tại ở đường dẫn này chưa
+        spark.read.format("delta").load(table_path)
+        logger.info(f"Table fact_jobs đã tồn tại tại {table_path}")
+    except Exception as e:
+        if "Path does not exist" in str(e) or "is not a Delta table" in str(e):
+            logger.info(f"Table fact_jobs chưa có tại {table_path}. Bắt đầu tạo mới...")
+            
+            # Định nghĩa Schema (cấu trúc) cho bảng fact_jobs
+            schema = StructType([
+                StructField("job_id", StringType(), True),
+                StructField("title", StringType(), True),
+                StructField("company", StringType(), True),
+                StructField("salary", StringType(), True),
+                StructField("locations", StringType(), True),
+                StructField("working_method", StringType(), True),
+                StructField("posted_date", DateType(), True),
+                StructField("skills", ArrayType(StringType()), True),
+                StructField("description", StringType(), True),
+                StructField("source", StringType(), True),
+                StructField("url", StringType(), True),
+                StructField("crawled_at", TimestampType(), True),
+                StructField("ingested_at", TimestampType(), True)
+            ])
+            
+            # Tạo DataFrame rỗng với schema trên
+            empty_df = spark.createDataFrame([], schema)
+            
+            # Ghi xuống Volume dưới định dạng Delta
+            empty_df.write.format("delta").mode("ignore").save(table_path)
+            logger.info(f"Đã tạo thành công Delta table rỗng tại {table_path}")
+        else:
+            logger.error(f"Lỗi khi kiểm tra table fact_jobs: {e}")
+            raise
