@@ -15,12 +15,10 @@ from typing import Any
 from dotenv import load_dotenv, find_dotenv
 
 # Bootstrap sys.path from .env before any local imports
+from src.utils.getProjectRoot import getRootPath
+
 load_dotenv(find_dotenv())
-PROJECT_ROOT = os.environ.get("PROJECT_ROOT") or str(
-    Path(__file__).resolve().parent.parent
-)
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+PROJECT_ROOT = getRootPath()
 
 from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
@@ -153,7 +151,9 @@ class TopDevScraper(BaseScraper):
         async with AsyncWebCrawler(config=self._browser_config) as crawler:
             result = await crawler.arun(url=url, config=self._crawler_config)
             if not result.success:
-                raise RuntimeError(f"Crawl4AI failed to fetch {url}: {result.error_message}")
+                raise RuntimeError(
+                    f"Crawl4AI failed to fetch {url}: {result.error_message}"
+                )
             return result.html
 
     async def _collect_all_slugs(self, max_pages: int) -> set:
@@ -164,7 +164,9 @@ class TopDevScraper(BaseScraper):
 
         all_slugs = set(self._extract_slugs_from_html(html1))
         total_pages = self._get_max_pages(html1) if max_pages <= 0 else max_pages
-        self.logger.info(f"Crawling {total_pages} pages. Page 1: {len(all_slugs)} slugs.")
+        self.logger.info(
+            f"Crawling {total_pages} pages. Page 1: {len(all_slugs)} slugs."
+        )
 
         for page in range(2, total_pages + 1):
             html = await self._fetch_list_page(f"{LIST_URL}?page={page}")
@@ -175,14 +177,13 @@ class TopDevScraper(BaseScraper):
             if not slugs:
                 break
             all_slugs.update(slugs)
-            
+
         return all_slugs
 
     def _build_url_id_map(self, slugs: set) -> dict:
         """Map slugs to full URLs and IDs."""
         return {
-            f"{BASE_URL}/detail-jobs/{slug}": _extract_job_id(slug)
-            for slug in slugs
+            f"{BASE_URL}/detail-jobs/{slug}": _extract_job_id(slug) for slug in slugs
         }
 
     # ── Detail page ────────────────────────────────────────────────────────────
@@ -191,12 +192,13 @@ class TopDevScraper(BaseScraper):
         """Parse TopDev job detail HTML."""
         soup = BeautifulSoup(html, "html.parser")
 
-        title_el = soup.select_one("h1") or soup.select_one("a.text-brand-500.font-semibold")
-        company_el = (
-            soup.select_one("a[href*='/companies/'] span") 
-            or soup.select_one("a[href*='/companies/']")
+        title_el = soup.select_one("h1") or soup.select_one(
+            "a.text-brand-500.font-semibold"
         )
-        
+        company_el = soup.select_one("a[href*='/companies/'] span") or soup.select_one(
+            "a[href*='/companies/']"
+        )
+
         salary_el = soup.select_one("[class*='salary']")
         if not salary_el:
             for span in soup.find_all("span"):
@@ -213,11 +215,16 @@ class TopDevScraper(BaseScraper):
                 deadline_text = text
                 break
 
-        skills = list({
-            a.get_text(strip=True) for a in soup.select("a[href*='keyword='], a[href*='/skills/']")
-        })
+        skills = list(
+            {
+                a.get_text(strip=True)
+                for a in soup.select("a[href*='keyword='], a[href*='/skills/']")
+            }
+        )
 
-        desc_el = soup.select_one("[class*='job-description']") or soup.select_one("article")
+        desc_el = soup.select_one("[class*='job-description']") or soup.select_one(
+            "article"
+        )
 
         return {
             "job_id": job_id,
@@ -227,7 +234,9 @@ class TopDevScraper(BaseScraper):
             "locations": location_el.get_text(strip=True) if location_el else "",
             "posted_date": _parse_topdev_date(deadline_text),
             "skills": skills,
-            "description": desc_el.get_text(separator="\n", strip=True) if desc_el else "",
+            "description": (
+                desc_el.get_text(separator="\n", strip=True) if desc_el else ""
+            ),
             "source": self.source_name,
             "url": url,
             "crawled_at": datetime.now(timezone.utc).isoformat(),
@@ -238,12 +247,14 @@ class TopDevScraper(BaseScraper):
     ) -> dict:
         """Fetch and parse a TopDev detail page via Playwright CDP."""
         async with semaphore:
-            context = await browser.new_context(user_agent=USER_AGENT, ignore_https_errors=True)
+            context = await browser.new_context(
+                user_agent=USER_AGENT, ignore_https_errors=True
+            )
             try:
                 await asyncio.sleep(random.uniform(1.0, 3.0))
                 await context.add_init_script(STEALTH_JS)
                 page = await context.new_page()
-                
+
                 await page.goto(url, wait_until="commit", timeout=60000)
                 await asyncio.sleep(5)  # Wait for React hydration
 
@@ -276,13 +287,13 @@ class TopDevScraper(BaseScraper):
         all_slugs = await self._collect_all_slugs(max_pages)
         url_id_map = self._build_url_id_map(all_slugs)
         new_job_ids, skipped = self._filter_new_ids(set(url_id_map.values()), existing)
-        
+
         if not new_job_ids:
             self.logger.info(f"No new jobs found ({skipped} already exist).")
             return []
 
         self.logger.info(f"{len(new_job_ids)} new jobs to scrape, {skipped} skipped.")
-        
+
         items = list({u: j for u, j in url_id_map.items() if j in new_job_ids}.items())
         total_saved = 0
         total_batches = (len(items) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -293,24 +304,30 @@ class TopDevScraper(BaseScraper):
             for i in range(0, len(items), BATCH_SIZE):
                 batch = dict(items[i : i + BATCH_SIZE])
                 batch_num = i // BATCH_SIZE + 1
-                
+
                 # Retry each batch once on browser disconnect
                 for attempt in range(2):
                     browser = await pw.chromium.connect_over_cdp(cdp_url, timeout=0)
                     try:
-                        saved = await self._process_batch(browser, batch, semaphore, existing)
+                        saved = await self._process_batch(
+                            browser, batch, semaphore, existing
+                        )
                         total_saved += saved
                         self.logger.info(
                             f"Batch {batch_num}/{total_batches}: saved {saved} jobs (total: {total_saved})"
                         )
-                        break # Success, move to next batch
+                        break  # Success, move to next batch
                     except BrowserDisconnectedError:
                         if attempt == 0:
-                            self.logger.warning(f"Batch {batch_num} disconnected — retrying...")
+                            self.logger.warning(
+                                f"Batch {batch_num} disconnected — retrying..."
+                            )
                             await asyncio.sleep(5)
                             continue
                         else:
-                            self.logger.error(f"Batch {batch_num} failed twice due to disconnect.")
+                            self.logger.error(
+                                f"Batch {batch_num} failed twice due to disconnect."
+                            )
                             break
                     finally:
                         await browser.close()
@@ -341,9 +358,14 @@ async def main():
 
 if __name__ == "__main__":
     if sys.platform == "win32":
+
         def _cleanup(unraisable):
-            if str(unraisable.exc_value) in ("I/O operation on closed pipe", "Event loop is closed"):
+            if str(unraisable.exc_value) in (
+                "I/O operation on closed pipe",
+                "Event loop is closed",
+            ):
                 return
             sys.__unraisablehook__(unraisable)
+
         sys.unraisablehook = _cleanup
     asyncio.run(main())
