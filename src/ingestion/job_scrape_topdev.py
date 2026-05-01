@@ -1,6 +1,7 @@
 import sys
 import os
 import asyncio
+from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
 
 # Đảm bảo Python có thể tìm thấy thư mục 'scrapers' ở thư mục gốc
@@ -24,4 +25,18 @@ if __name__ == "__main__":
 
     # Kích hoạt Scraper
     print("🚀 Bắt đầu Job Scrape TopDev...")
-    asyncio.run(main())
+    
+    # Xử lý lỗi "asyncio.run() cannot be called from a running event loop" trên Databricks/Jupyter
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # Nếu đang ở trong một Event Loop (vd: Notebook), dùng nest_asyncio để patch
+        import nest_asyncio
+        nest_asyncio.apply()
+        loop.run_until_complete(main())
+    else:
+        # Nếu chạy script bình thường trên terminal
+        asyncio.run(main())
