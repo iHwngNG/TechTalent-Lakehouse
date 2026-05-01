@@ -8,30 +8,25 @@ import asyncio
 import argparse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Set, Tuple
-
+from typing import Any
+from src.utils.getProjectRoot import getRootPath
 from dotenv import load_dotenv, find_dotenv
 
 # Bootstrap sys.path from .env before any local imports
 load_dotenv(find_dotenv())
-PROJECT_ROOT = os.environ.get("PROJECT_ROOT") or str(
-    Path(__file__).resolve().parent.parent
-)
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
+PROJECT_ROOT = getRootPath()
 from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from playwright.async_api import async_playwright
 
-from scrapers.base_scraper import BaseScraper, async_retry
+from scrapers.base_scraper import BaseScraper, async_retry, BrowserDisconnectedError
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 BASE_URL = "https://itviec.com"
 LIST_URL = f"{BASE_URL}/it-jobs"
-BATCH_SIZE = 20
-CONCURRENCY = 5
+BATCH_SIZE = 5  # Sequential processing for tunnel stability
+CONCURRENCY = 1
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -224,12 +219,20 @@ class ItviecScraper(BaseScraper):
             try:
                 await context.add_init_script(STEALTH_JS)
                 page = await context.new_page()
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await page.goto(url, wait_until="commit", timeout=60000)
                 await page.wait_for_selector("h1", timeout=30000)
+
+                if page.is_closed():
+                    raise BrowserDisconnectedError(f"Page closed at {url}")
+
                 html = await page.content()
                 slug = identifier.removeprefix(f"{self.source_name}_")
                 return self._extract_detail_from_html(html, slug, url)
             except Exception as e:
+                if "Target page, context or browser has been closed" in str(e):
+                    raise BrowserDisconnectedError(
+                        f"Browser disconnected during fetch of {url}: {e}"
+                    )
                 self.logger.error(f"Detail fetch failed [{url}]: {e}")
                 return {}
             finally:
@@ -275,20 +278,38 @@ class ItviecScraper(BaseScraper):
         cdp_url = os.environ.get("BROWSER_WS_URL", "ws://localhost:3000")
 
         async with async_playwright() as pw:
-            browser = await pw.chromium.connect_over_cdp(cdp_url)
             semaphore = asyncio.Semaphore(CONCURRENCY)
 
             for i in range(0, len(items), BATCH_SIZE):
                 batch = dict(items[i : i + BATCH_SIZE])
                 batch_num = i // BATCH_SIZE + 1
-                saved = await self._process_batch(browser, batch, semaphore, existing)
-                total_saved += saved
-                self.logger.info(
-                    f"Batch {batch_num}/{total_batches}: saved {saved} jobs "
-                    f"(total: {total_saved})"
-                )
 
-            await browser.close()
+                for attempt in range(2):
+                    browser = await pw.chromium.connect_over_cdp(cdp_url, timeout=0)
+                    try:
+                        saved = await self._process_batch(
+                            browser, batch, semaphore, existing
+                        )
+                        total_saved += saved
+                        self.logger.info(
+                            f"Batch {batch_num}/{total_batches}: saved {saved} jobs "
+                            f"(total: {total_saved})"
+                        )
+                        break
+                    except BrowserDisconnectedError:
+                        if attempt == 0:
+                            self.logger.warning(
+                                f"Batch {batch_num} disconnected — retrying..."
+                            )
+                            await asyncio.sleep(5)
+                            continue
+                        else:
+                            self.logger.error(
+                                f"Batch {batch_num} failed twice due to disconnect."
+                            )
+                            break
+                    finally:
+                        await browser.close()
 
         self.logger.info(f"Scrape complete — {total_saved} new jobs saved.")
         return []
