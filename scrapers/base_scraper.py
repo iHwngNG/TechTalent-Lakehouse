@@ -3,6 +3,8 @@ import asyncio
 import time
 import json
 import os
+import uuid
+import shutil
 import logging
 import functools
 import traceback
@@ -296,19 +298,25 @@ class BaseScraper(abc.ABC):
         return len(batch)
 
     def save_to_volume(self, data: list) -> str:
-        """Append records to the scraper's daily JSONL file in the Databricks Volume."""
+        """Save records to a new unique JSONL file in the Databricks Volume (FUSE-compatible)."""
         if not data:
             return ""
 
         Path(self.volume_dir).mkdir(parents=True, exist_ok=True)
-        date_str = datetime.now().strftime("%Y%m%d")
-        output_path = os.path.join(
-            self.volume_dir, f"{self.source_name}_{date_str}.jsonl"
-        )
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        batch_id = uuid.uuid4().hex[:8]
+        filename = f"{self.source_name}_{date_str}_{batch_id}.jsonl"
+        output_path = os.path.join(self.volume_dir, filename)
+        
+        # Databricks FUSE Volume workaround: write to local /tmp first, then copy
+        tmp_path = os.path.join("/tmp" if sys.platform != "win32" else os.environ.get("TEMP", "C:/tmp"), filename)
 
-        with open(output_path, "a", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             for item in data:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                
+        shutil.copy(tmp_path, output_path)
+        os.remove(tmp_path)
 
         self.logger.info(f"Saved {len(data)} records → {output_path}")
         return output_path
@@ -337,13 +345,23 @@ class BaseScraper(abc.ABC):
         self.save_error_record(record)
 
     def save_error_record(self, record: dict) -> None:
-        """Append a pre-formatted error dict to the shared daily error JSONL Volume."""
+        """Save a pre-formatted error dict to a new unique JSONL file in the error Volume."""
         try:
             Path(ERROR_VOLUME).mkdir(parents=True, exist_ok=True)
-            date_str = datetime.now().strftime("%Y%m%d")
-            error_path = os.path.join(ERROR_VOLUME, f"errors_{date_str}.jsonl")
-            with open(error_path, "a", encoding="utf-8") as f:
+            date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            batch_id = uuid.uuid4().hex[:8]
+            filename = f"error_{date_str}_{batch_id}.jsonl"
+            error_path = os.path.join(ERROR_VOLUME, filename)
+            
+            # Databricks FUSE Volume workaround
+            tmp_path = os.path.join("/tmp" if sys.platform != "win32" else os.environ.get("TEMP", "C:/tmp"), filename)
+            
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                
+            shutil.copy(tmp_path, error_path)
+            os.remove(tmp_path)
+            
             self.logger.error(
                 f"[{record.get('context')}] {record.get('error_type')}: {record.get('error_msg')}"
             )
