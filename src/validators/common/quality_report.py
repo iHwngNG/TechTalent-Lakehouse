@@ -12,7 +12,7 @@ from pyspark.sql.types import (
 from src.utils.databricks_catalog import CATALOG, SCHEMA
 
 # Path to the DQ metrics Delta table inside the healthReport volume
-DQ_TABLE_PATH = f"/Volumes/{CATALOG}/{SCHEMA}/healthReport/quality_report"
+DQ_TABLE_PATH = f"/Volumes/{CATALOG}/{SCHEMA}/healthReport"
 
 
 def build_report(all_results: dict, stage: str) -> list[dict]:
@@ -41,7 +41,9 @@ def build_report(all_results: dict, stage: str) -> list[dict]:
     return rows
 
 
-def write_report(spark: SparkSession, all_results: dict, stage: str, batch_id: int = 0) -> None:
+def write_report(
+    spark: SparkSession, all_results: dict, stage: str, batch_id: int = 0
+) -> None:
     """
     Summarize all validator results and append them as a Delta table
     at DQ_TABLE_PATH for audit and monitoring purposes.
@@ -68,7 +70,9 @@ def write_report(spark: SparkSession, all_results: dict, stage: str, batch_id: i
 
         rows = build_report(all_results, stage)
         if not rows:
-            print(f"[DQ Report] Stage {stage} - Batch {batch_id}: no metrics to write, skipping.")
+            print(
+                f"[DQ Report] Stage {stage} - Batch {batch_id}: no metrics to write, skipping."
+            )
             return
 
         df_report = spark.createDataFrame(rows, schema=report_schema)
@@ -87,4 +91,6 @@ def write_report(spark: SparkSession, all_results: dict, stage: str, batch_id: i
 
     except Exception as e:
         # Non-critical: DQ report failure must never block the pipeline
-        print(f"[DQ Report] Stage {stage} - Batch {batch_id}: failed to write report — {e}")
+        print(
+            f"[DQ Report] Stage {stage} - Batch {batch_id}: failed to write report — {e}"
+        )
