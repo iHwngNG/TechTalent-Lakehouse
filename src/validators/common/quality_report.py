@@ -25,18 +25,28 @@ def build_report(all_results: dict, stage: str) -> list[dict]:
     rows = []
 
     for metric_name, result in all_results.items():
-        rows.append(
-            {
-                "timestamp": timestamp,
-                "stage": stage,
-                "source": result.get("source", "unknown"),
-                "metric_name": metric_name,
-                "value": float(result.get("value", -1)),
-                "total": float(result.get("total", -1)),
-                "status": result.get("status", "UNKNOWN"),
-                "message": result.get("error", result.get("message", "")),
-            }
-        )
+        if isinstance(result, Exception):
+            rows.append(
+                {
+                    "timestamp": timestamp,
+                    "stage": stage,
+                    "source": "unknown",
+                    "metric_name": type(result).__name__,
+                    "status": "FAIL",
+                    "message": str(result),
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "timestamp": timestamp,
+                    "stage": stage,
+                    "source": result.get("source", "unknown"),
+                    "metric_name": metric_name,
+                    "status": result.get("status", "UNKNOWN"),
+                    "message": result.get("error", result.get("message", "")),
+                }
+            )
 
     return rows
 
@@ -50,19 +60,21 @@ def write_report(
 
     Args:
         spark:       Active SparkSession.
-        all_results: Merged dict from null_check and duplicate_check results or error details.
+        all_results: Merged dict from null_check and duplicate_check results, OR an Exception object.
         stage:       Pipeline stage ('bronze', 'silver', 'gold').
         batch_id:    Micro-batch ID for traceability (default 0 for standalone use).
     """
     try:
+        if isinstance(all_results, Exception):
+            all_results = {
+                type(all_results).__name__: all_results
+            }
         report_schema = StructType(
             [
                 StructField("timestamp", TimestampType(), False),
                 StructField("stage", StringType(), False),
                 StructField("source", StringType(), False),
                 StructField("metric_name", StringType(), False),
-                StructField("value", DoubleType(), True),
-                StructField("total", DoubleType(), True),
                 StructField("status", StringType(), False),
                 StructField("message", StringType(), True),
             ]
