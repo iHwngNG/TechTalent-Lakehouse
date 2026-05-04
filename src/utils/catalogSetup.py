@@ -2,11 +2,10 @@ import sys
 import os
 import logging
 from pyspark.sql import SparkSession
+from src.utils.getProjectRoot import getRootPath
 
 # Đảm bảo Python có thể tìm thấy các module từ thư mục gốc của project
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+getRootPath()
 
 from src.utils.databricks_catalog import (
     bootstrap_volumes,
