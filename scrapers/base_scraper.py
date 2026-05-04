@@ -256,7 +256,9 @@ class BaseScraper(abc.ABC):
                 self.logger.error(f"Unexpected error fetching {url}: {result}")
                 continue
             elif result and isinstance(result, dict) and result.get("title"):
-                if self.is_new_job(result["job_id"], result.get("posted_date", ""), existing):
+                if self.is_new_job(
+                    result["job_id"], result.get("posted_date", ""), existing
+                ):
                     batch_jobs.append(result)
 
         if not batch_jobs:
@@ -279,13 +281,53 @@ class BaseScraper(abc.ABC):
         critical_fields: tuple = ("title", "company"),
         threshold: float = DQ_EMPTY_THRESHOLD,
     ) -> None:
-        """Data quality gate — delegates to the bronze layer validator."""
-        validate_bronze_data(
+        result = validate_bronze_data(
             data=data,
             source_name=self.source_name,
             critical_fields=critical_fields,
             threshold=threshold,
         )
+        
+        # Lấy metrics nếu hàm trả về tuple (phiên bản mới)
+        if isinstance(result, tuple):
+            invalid_count, total, msg = result
+            
+            try:
+                from src.validators.common.quality_report import write_report
+                from pyspark.sql import SparkSession
+                
+                try:
+                    from databricks.sdk.runtime import spark
+                    if spark is None:
+                        raise ImportError
+                except ImportError:
+                    try:
+                        spark = SparkSession.getActiveSession()
+                        if spark is None: raise Exception
+                    except Exception:
+                        try:
+                            from databricks.connect import DatabricksSession
+                            spark = DatabricksSession.builder.serverless(True).getOrCreate()
+                        except Exception:
+                            spark = SparkSession.builder.appName("Scraper_ErrorHandler").getOrCreate()
+
+                metric_data = {
+                    "missing_critical_fields": {
+                        "value": invalid_count,
+                        "total": total,
+                        "status": "FAIL" if (invalid_count / total) > threshold else ("WARNING" if invalid_count > 0 else "PASS"),
+                        "source": self.source_name,
+                        "error": msg if invalid_count > 0 else ""
+                    }
+                }
+                
+                write_report(spark, metric_data, stage="bronze")
+            except Exception as e:
+                self.logger.error(f"Failed to write bronze quality report: {e}")
+            
+            # Raise lỗi nếu vượt ngưỡng để chặn việc lưu file rác
+            if (invalid_count / total) > threshold:
+                raise ValueError(msg)
 
     def save_batch(
         self, batch: list, critical_fields: tuple = ("title", "company")
@@ -307,14 +349,17 @@ class BaseScraper(abc.ABC):
         batch_id = uuid.uuid4().hex[:8]
         filename = f"{self.source_name}_{date_str}_{batch_id}.jsonl"
         output_path = os.path.join(self.volume_dir, filename)
-        
+
         # Databricks FUSE Volume workaround: write to local /tmp first, then copy
-        tmp_path = os.path.join("/tmp" if sys.platform != "win32" else os.environ.get("TEMP", "C:/tmp"), filename)
+        tmp_path = os.path.join(
+            "/tmp" if sys.platform != "win32" else os.environ.get("TEMP", "C:/tmp"),
+            filename,
+        )
 
         with open(tmp_path, "w", encoding="utf-8") as f:
             for item in data:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
-                
+
         shutil.copy(tmp_path, output_path)
         os.remove(tmp_path)
 
@@ -345,26 +390,46 @@ class BaseScraper(abc.ABC):
         self.save_error_record(record)
 
     def save_error_record(self, record: dict) -> None:
-        """Save a pre-formatted error dict to a new unique JSONL file in the error Volume."""
+        """Save a pre-formatted error dict to the Delta healthReport table."""
         try:
-            Path(ERROR_VOLUME).mkdir(parents=True, exist_ok=True)
-            date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            batch_id = uuid.uuid4().hex[:8]
-            filename = f"error_{date_str}_{batch_id}.jsonl"
-            error_path = os.path.join(ERROR_VOLUME, filename)
+            from src.validators.common.quality_report import write_report
+            from pyspark.sql import SparkSession
             
-            # Databricks FUSE Volume workaround
-            tmp_path = os.path.join("/tmp" if sys.platform != "win32" else os.environ.get("TEMP", "C:/tmp"), filename)
+            # Khởi tạo hoặc lấy Spark session
+            try:
+                from databricks.sdk.runtime import spark
+                if spark is None:
+                    raise ImportError
+            except ImportError:
+                try:
+                    spark = SparkSession.getActiveSession()
+                    if spark is None:
+                        raise Exception
+                except Exception:
+                    try:
+                        from databricks.connect import DatabricksSession
+                        spark = DatabricksSession.builder.serverless(True).getOrCreate()
+                    except Exception:
+                        spark = SparkSession.builder.appName("Scraper_ErrorHandler").getOrCreate()
+
+            # Chuyển đổi định dạng lỗi sang định dạng của quality_report
+            metric_name = f"scraper_error_{record.get('error_type', 'unknown')}"
             
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                
-            shutil.copy(tmp_path, error_path)
-            os.remove(tmp_path)
+            error_data = {
+                metric_name: {
+                    "value": 1,
+                    "total": 1,
+                    "status": "FAIL",
+                    "source": self.source_name,
+                    "error": f"[{record.get('context')}] {record.get('error_msg')}\n{record.get('traceback', '')}",
+                }
+            }
             
+            write_report(spark, error_data, stage="bronze")
+
             self.logger.error(
                 f"[{record.get('context')}] {record.get('error_type')}: {record.get('error_msg')}"
             )
         except Exception as write_err:
-            self.logger.error(f"Failed to write error to volume: {write_err}")
+            self.logger.error(f"Failed to write error to healthReport Delta table: {write_err}")
             self.logger.error(f"Original record: {json.dumps(record)}")
