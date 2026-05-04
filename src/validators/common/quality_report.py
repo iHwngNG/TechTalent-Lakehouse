@@ -89,8 +89,25 @@ def write_report(
 
         df_report = spark.createDataFrame(rows, schema=report_schema)
 
+        # Optimize output for Delta Lake (Max 1GB per file)
+        spark.conf.set("spark.databricks.delta.optimizeWrite.enabled", "true")
+        spark.conf.set("spark.databricks.delta.autoCompact.enabled", "true")
+        spark.conf.set("spark.databricks.delta.properties.defaults.targetFileSize", "1073741824") # 1GB in bytes
+
+        # Coalesce to 1 partition to prevent multiple small files per batch write
+        df_report = df_report.coalesce(1)
+
         # Append to the DQ metrics table (never overwrite historical records)
         df_report.write.format("delta").mode("append").save(DQ_TABLE_PATH)
+
+        # Try to explicitly set table properties (works if table already exists)
+        try:
+            spark.sql(f"ALTER TABLE delta.`{DQ_TABLE_PATH}` SET TBLPROPERTIES ("
+                      f"'delta.targetFileSize' = '1073741824', "
+                      f"'delta.autoOptimize.optimizeWrite' = 'true', "
+                      f"'delta.autoOptimize.autoCompact' = 'true')")
+        except Exception:
+            pass
 
         # Print summary to Databricks Job logs
         fail_count = sum(1 for r in rows if r["status"] == "FAIL")
