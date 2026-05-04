@@ -30,16 +30,15 @@ def check_nulls(df: DataFrame, source: str) -> dict:
                 ).count()
 
                 status = "FAIL" if null_count > 0 else "PASS"
+                message = f"Found {null_count} nulls out of {total} records" if null_count > 0 else f"No nulls found in {total} records"
+                
                 results[metric_key] = {
-                    "value": null_count,
-                    "total": total,
                     "status": status,
                     "source": source,
+                    "message": message
                 }
             except Exception as col_err:
                 results[metric_key] = {
-                    "value": -1,
-                    "total": total,
                     "status": "ERROR",
                     "source": source,
                     "error": str(col_err),
@@ -50,8 +49,6 @@ def check_nulls(df: DataFrame, source: str) -> dict:
     except Exception as e:
         return {
             "null_check_error": {
-                "value": -1,
-                "total": -1,
                 "status": "ERROR",
                 "source": source,
                 "error": str(e),

@@ -37,21 +37,19 @@ def check_duplicates(df: DataFrame, source: str) -> dict:
         duplicate_count = int(dup_rows) if dup_rows is not None else 0
 
         status = "FAIL" if duplicate_count > 0 else "PASS"
+        message = f"Found {duplicate_count} duplicates out of {total} records" if duplicate_count > 0 else f"No duplicates found in {total} records"
 
         return {
             "duplicate_composite_key": {
-                "value": duplicate_count,
-                "total": total,
                 "status": status,
                 "source": source,
+                "message": message
             }
         }
 
     except Exception as e:
         return {
             "duplicate_composite_key": {
-                "value": -1,
-                "total": -1,
                 "status": "ERROR",
                 "source": source,
                 "error": str(e),
