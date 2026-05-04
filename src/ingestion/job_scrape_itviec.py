@@ -7,7 +7,7 @@ from src.utils.getProjectRoot import getRootPath
 
 # Đảm bảo Python có thể tìm thấy thư mục 'scrapers' ở thư mục gốc
 load_dotenv(find_dotenv())
-PROJECT_ROOT = getRootPath()
+getRootPath()
 
 from scrapers.itviec_scraper import main
 
