@@ -1,7 +1,5 @@
 import sys
-import os
 import asyncio
-from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
 from src.utils.getProjectRoot import getRootPath
 
