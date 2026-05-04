@@ -2,7 +2,8 @@ import sys
 import os
 from pathlib import Path
 
-# Thêm project root vào sys.path trước khi import các module khác
+# Tuyệt đối không import bất kỳ module 'src' nào ở global scope.
+# Dùng pathlib để thiết lập sys.path chuẩn xác.
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent.parent)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -11,10 +12,11 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, current_timestamp, expr
 from pyspark.sql.types import StructType, StructField, StringType, ArrayType
 from delta.tables import DeltaTable
-from src.validators.silver.null_check import check_nulls
-from src.validators.silver.duplicate_check import check_duplicates
-from src.validators.common.quality_report import write_report
-from src.utils.databricks_catalog import CATALOG, SCHEMA
+
+# Thay vì import từ src.utils.databricks_catalog, ta nạp trực tiếp giá trị vào global scope
+# vì databricks_catalog nằm trong src, nếu import ở đây cloudpickle sẽ crash ở Serverless runner.
+CATALOG = "workspace"
+SCHEMA = "techtalent_lakehouse"
 
 # Number of output Parquet partitions per micro-batch.
 # Keep at 1 for small daily datasets (~thousands of jobs) to avoid Small Files.
@@ -109,6 +111,17 @@ def transform_jobs():
         Consolidate partitions (coalesce), deduplicate, then MERGE INTO Silver.
         Call OPTIMIZE after MERGE to compact Parquet files.
         """
+        import sys
+        
+        # Đưa PROJECT_ROOT (đã lấy từ Driver) vào sys.path của Worker/Runner
+        if PROJECT_ROOT not in sys.path:
+            sys.path.insert(0, PROJECT_ROOT)
+            
+        # Import cục bộ để tránh lỗi cloudpickle không tìm thấy module trên Worker
+        from src.validators.silver.null_check import check_nulls
+        from src.validators.silver.duplicate_check import check_duplicates
+        from src.validators.common.quality_report import write_report
+
         if not micro_batch_df.head(1):
             return
 
