@@ -1,17 +1,19 @@
 import sys
 import os
+from pathlib import Path
+
+# Thêm project root vào sys.path trước khi import các module khác
+PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent.parent)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, current_timestamp, expr
 from pyspark.sql.types import StructType, StructField, StringType, ArrayType
 from delta.tables import DeltaTable
-from src.utils.getProjectRoot import getRootPath
 from src.validators.silver.null_check import check_nulls
 from src.validators.silver.duplicate_check import check_duplicates
 from src.validators.common.quality_report import write_report
-
-# Bootstrap sys.path
-PROJECT_ROOT = getRootPath()
-
 from src.utils.databricks_catalog import CATALOG, SCHEMA
 
 # Number of output Parquet partitions per micro-batch.
