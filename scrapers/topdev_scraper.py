@@ -9,7 +9,6 @@ import asyncio
 import argparse
 import random
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv, find_dotenv
@@ -30,30 +29,15 @@ from scrapers.base_scraper import (
     BrowserDisconnectedError,
     AntiBotDetectedError,
 )
+from config.settings import settings
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 BASE_URL = "https://topdev.vn"
 LIST_URL = f"{BASE_URL}/jobs/search"
-BATCH_SIZE = 1  # Sequential processing for maximum stability over tunnels
-CONCURRENCY = 1
+BATCH_SIZE = settings.get_batch_size("topdev")
+CONCURRENCY = settings.get_concurrency("topdev")
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-# Patches navigator properties before page navigation to avoid bot detection
-STEALTH_JS = """
-    Object.defineProperty(navigator, 'webdriver', {get: () => false});
-    window.chrome = {runtime: {}};
-    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en', 'vi']});
-    // Add fake screen properties
-    Object.defineProperty(screen, 'width', {get: () => 1920});
-    Object.defineProperty(screen, 'height', {get: () => 1080});
-"""
 
 _ANTIBOT_MARKERS = [
     "cf-browser-verification",
@@ -248,11 +232,12 @@ class TopDevScraper(BaseScraper):
         """Fetch and parse a TopDev detail page via Playwright CDP."""
         async with semaphore:
             context = await browser.new_context(
-                user_agent=USER_AGENT, ignore_https_errors=True
+                user_agent=settings.USER_AGENT, ignore_https_errors=True
             )
             try:
                 await asyncio.sleep(random.uniform(1.0, 3.0))
-                await context.add_init_script(STEALTH_JS)
+                if settings.STEALTH_JS:
+                    await context.add_init_script(settings.STEALTH_JS)
                 page = await context.new_page()
 
                 await page.goto(url, wait_until="commit", timeout=60000)
@@ -354,18 +339,3 @@ async def main():
     finally:
         if sys.platform == "win32":
             await asyncio.sleep(0.25)
-
-
-if __name__ == "__main__":
-    if sys.platform == "win32":
-
-        def _cleanup(unraisable):
-            if str(unraisable.exc_value) in (
-                "I/O operation on closed pipe",
-                "Event loop is closed",
-            ):
-                return
-            sys.__unraisablehook__(unraisable)
-
-        sys.unraisablehook = _cleanup
-    asyncio.run(main())

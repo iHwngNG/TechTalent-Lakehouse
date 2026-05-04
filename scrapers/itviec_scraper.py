@@ -19,28 +19,17 @@ from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from playwright.async_api import async_playwright
 
-from scrapers.base_scraper import BaseScraper, async_retry, BrowserDisconnectedError
-
-# ── Constants ──────────────────────────────────────────────────────────────────
+from scrapers.base_scraper import (
+    BaseScraper,
+    async_retry,
+    BrowserDisconnectedError,
+)
+from config.settings import settings
 
 BASE_URL = "https://itviec.com"
 LIST_URL = f"{BASE_URL}/it-jobs"
-BATCH_SIZE = 5  # Sequential processing for tunnel stability
-CONCURRENCY = 1
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-# Patches navigator properties before page navigation to avoid bot detection
-STEALTH_JS = """
-    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-    window.chrome = {runtime: {}};
-    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en', 'vi']});
-"""
+BATCH_SIZE = settings.get_batch_size("itviec")
+CONCURRENCY = settings.get_concurrency("itviec")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -214,10 +203,11 @@ class ItviecScraper(BaseScraper):
         """
         async with semaphore:
             context = await browser.new_context(
-                user_agent=USER_AGENT, ignore_https_errors=True
+                user_agent=settings.USER_AGENT, ignore_https_errors=True
             )
             try:
-                await context.add_init_script(STEALTH_JS)
+                if settings.STEALTH_JS:
+                    await context.add_init_script(settings.STEALTH_JS)
                 page = await context.new_page()
                 await page.goto(url, wait_until="commit", timeout=60000)
                 await page.wait_for_selector("h1", timeout=30000)
@@ -341,18 +331,3 @@ async def main():
     finally:
         if sys.platform == "win32":
             await asyncio.sleep(0.25)
-
-
-if __name__ == "__main__":
-    if sys.platform == "win32":
-
-        def _suppress_win32_cleanup(unraisable):
-            # Suppress known Python 3.9 Windows ProactorEventLoop noise
-            msg = str(unraisable.exc_value)
-            if msg in ("I/O operation on closed pipe", "Event loop is closed"):
-                return
-            sys.__unraisablehook__(unraisable)
-
-        sys.unraisablehook = _suppress_win32_cleanup
-
-    asyncio.run(main())
