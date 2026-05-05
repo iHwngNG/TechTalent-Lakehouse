@@ -224,7 +224,7 @@ class ItviecScraper(BaseScraper):
                         f"Browser disconnected during fetch of {url}: {e}"
                     )
                 self.logger.error(f"Detail fetch failed [{url}]: {e}")
-                return {}
+                raise e
             finally:
                 await context.close()
 

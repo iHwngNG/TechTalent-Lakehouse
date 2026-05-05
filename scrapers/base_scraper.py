@@ -248,12 +248,15 @@ class BaseScraper(abc.ABC):
             url = valid_urls[i]
             if isinstance(result, BrowserDisconnectedError):
                 self.logger.error(f"Browser disconnected during fetch of {url}")
+                self.save_error(result, context=f"fetch_detail_{url}")
                 raise result  # Escalating to trigger batch-level reconnection
             elif isinstance(result, AntiBotDetectedError):
                 self.logger.warning(f"Anti-bot detected at {url} - skipping")
+                self.save_error(result, context=f"fetch_detail_{url}")
                 continue
             elif isinstance(result, Exception):
                 self.logger.error(f"Unexpected error fetching {url}: {result}")
+                self.save_error(result, context=f"fetch_detail_{url}")
                 continue
             elif result and isinstance(result, dict) and result.get("title"):
                 if self.is_new_job(

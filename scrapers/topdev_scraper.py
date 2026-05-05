@@ -257,7 +257,7 @@ class TopDevScraper(BaseScraper):
                 if any(kw in str(e).lower() for kw in _DISCONNECT_KEYWORDS):
                     raise BrowserDisconnectedError(f"CDP Disconnect: {e}")
                 self.logger.error(f"Detail fetch failed [{url}]: {e}")
-                return {}
+                raise e
             finally:
                 await context.close()
 
