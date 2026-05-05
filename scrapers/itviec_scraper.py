@@ -17,18 +17,29 @@ load_dotenv(find_dotenv())
 PROJECT_ROOT = getRootPath()
 from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+import random
 from playwright.async_api import async_playwright
 
 from scrapers.base_scraper import (
     BaseScraper,
     async_retry,
     BrowserDisconnectedError,
+    AntiBotDetectedError,
 )
 from config.settings import settings
 
 BASE_URL = "https://itviec.com"
 LIST_URL = f"{BASE_URL}/it-jobs"
 BATCH_SIZE = settings.get_batch_size("itviec")
+
+# Markers that appear ONLY on Cloudflare challenge pages (not normal pages on CF CDN)
+_ANTIBOT_MARKERS = [
+    "cf-browser-verification",
+    "cf_challenge_form",
+    "cf-turnstile",
+    "just a moment",  # Cloudflare's challenge page title text
+    "checking your browser",  # Cloudflare challenge message
+]
 CONCURRENCY = settings.get_concurrency("itviec")
 
 
@@ -206,18 +217,34 @@ class ItviecScraper(BaseScraper):
                 user_agent=settings.USER_AGENT, ignore_https_errors=True
             )
             try:
+                # 1. Human-like Delay to prevent thundering herd & bot detection
+                await asyncio.sleep(random.uniform(1.5, 4.0))
+                
                 if settings.STEALTH_JS:
                     await context.add_init_script(settings.STEALTH_JS)
                 page = await context.new_page()
-                await page.goto(url, wait_until="commit", timeout=60000)
-                await page.wait_for_selector("h1", timeout=30000)
-
+                
+                # 2. Wait until basic DOM loads, not commit
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                
                 if page.is_closed():
                     raise BrowserDisconnectedError(f"Page closed at {url}")
-
+                
+                # 3. Proactive Anti-bot check before waiting for h1
                 html = await page.content()
+                if any(m in html.lower() for m in _ANTIBOT_MARKERS):
+                    raise AntiBotDetectedError(f"Anti-bot block at {url}")
+                
+                # 4. Wait for specific content
+                await page.wait_for_selector("h1", timeout=30000)
+                
+                # Re-fetch HTML after React hydrated/h1 appears
+                html = await page.content()
+
                 slug = identifier.removeprefix(f"{self.source_name}_")
                 return self._extract_detail_from_html(html, slug, url)
+            except (BrowserDisconnectedError, AntiBotDetectedError):
+                raise
             except Exception as e:
                 if "Target page, context or browser has been closed" in str(e):
                     raise BrowserDisconnectedError(
