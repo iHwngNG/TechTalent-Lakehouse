@@ -39,8 +39,6 @@ The current implementation focuses on the core of the platform:
 - Logging quality metrics and runtime failures into a shared monitoring table
 - Supplying SQL queries for pipeline health and data-quality monitoring
 
-The PRD in [PRD_TechTalent_Lakehouse.md](/d:/Experimental%20Ground/TechTalent%20Lakehouse/doc/PRD_TechTalent_Lakehouse.md) describes a broader roadmap as well, including additional sources, Gold analytics marts, and dashboard-driven business insights. The current codebase already implements the pipeline foundation those next layers would build on.
-
 ## Architecture at a glance
 
 The project follows a Medallion-style pattern:
