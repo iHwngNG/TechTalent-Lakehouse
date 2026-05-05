@@ -1,0 +1,52 @@
+resources:
+  jobs:
+    TechTalen_Lakehouse_Pipeline:
+      name: TechTalen-Lakehouse-Pipeline
+      email_notifications:
+        on_start:
+          - hwng.nvq@gmail.com
+        on_success:
+          - hwng.nvq@gmail.com
+        on_failure:
+          - hwng.nvq@gmail.com
+      schedule:
+        quartz_cron_expression: 0 0 7 * * ?
+        timezone_id: Asia/Ho_Chi_Minh
+        pause_status: UNPAUSED
+      tasks:
+        - task_key: setup_catalog
+          spark_python_task:
+            python_file: /Workspace/Users/hwng.nvq@gmail.com/TechTalent-Lakehouse/src/utils/catalogSetup.py
+          environment_key: Default
+        - task_key: scrapeITViec
+          depends_on:
+            - task_key: setup_catalog
+          spark_python_task:
+            python_file: /Workspace/Users/hwng.nvq@gmail.com/TechTalent-Lakehouse/src/ingestion/job_scrape_itviec.py
+          environment_key: TechTalent-Lakehouse-env
+        - task_key: scrapeTopdev
+          depends_on:
+            - task_key: setup_catalog
+          spark_python_task:
+            python_file: /Workspace/Users/hwng.nvq@gmail.com/TechTalent-Lakehouse/src/ingestion/job_scrape_topdev.py
+          environment_key: TechTalent-Lakehouse-env
+        - task_key: Transform_jobs
+          depends_on:
+            - task_key: scrapeTopdev
+            - task_key: scrapeITViec
+          spark_python_task:
+            python_file: /Workspace/Users/hwng.nvq@gmail.com/TechTalent-Lakehouse/src/transformation/bronzeToSilver/01_transform_jobs.py
+          environment_key: Default
+      queue:
+        enabled: true
+      environments:
+        - environment_key: Default
+          spec:
+            environment_version: "5"
+        - environment_key: TechTalent-Lakehouse-env
+          spec:
+            dependencies:
+              - -r
+                /Workspace/Users/hwng.nvq@gmail.com/TechTalent-Lakehouse/databricks/conf/dependencies.txt
+            environment_version: "5"
+      performance_target: PERFORMANCE_OPTIMIZED
