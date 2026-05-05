@@ -1,3 +1,4 @@
+import time
 from datetime import datetime
 
 from pyspark.sql import DataFrame, SparkSession
@@ -101,8 +102,17 @@ def write_report(
         except Exception:
             pass
 
-        # Append to the DQ metrics table (never overwrite historical records)
-        df_report.write.format("delta").mode("append").option("mergeSchema", "true").save(DQ_TABLE_PATH)
+        # Append to the DQ metrics table with retry for transient S3/network errors
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                df_report.write.format("delta").mode("append").option("mergeSchema", "true").save(DQ_TABLE_PATH)
+                break
+            except Exception as write_err:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s
+                else:
+                    raise write_err
 
         # Print summary to Databricks Job logs
         fail_count = sum(1 for r in rows if r["status"] == "FAIL")
