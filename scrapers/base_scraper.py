@@ -311,17 +311,30 @@ class BaseScraper(abc.ABC):
                         except Exception:
                             spark = SparkSession.builder.appName("Scraper_ErrorHandler").getOrCreate()
 
-                metric_data = {
-                    "missing_critical_fields": {
-                        "value": invalid_count,
-                        "total": total,
-                        "status": "FAIL" if (invalid_count / total) > threshold else ("WARNING" if invalid_count > 0 else "PASS"),
+                # Report EACH job situation for granular monitoring
+                results_to_report = {}
+                for item in data:
+                    job_id = item.get("job_id", "unknown")
+                    # Dùng job_id hoặc URL làm unique key tạm thời để tránh ghi đè trong dict,
+                    # nhưng báo cáo sẽ hiển thị metric_name đồng nhất (nhờ thay đổi ở quality_report nếu cần... chờ đã, build_report lấy key làm metric_name).
+                    # Ta dùng UUID hoặc ID nối với metric name.
+                    dict_key = f"data_completeness_{job_id}"
+                    
+                    missing = [f for f in critical_fields if not item.get(f)]
+                    status = "PASS" if not missing else "FAIL"
+                    item_msg = f"Valid" if status == "PASS" else f"Missing: {', '.join(missing)}"
+                    
+                    results_to_report[dict_key] = {
+                        "metric_name": "validate_bronze_data", # Name of the validator
+                        "object": item.get("url", job_id),  # Ở Bronze hiển thị URL
+                        "status": status,
                         "source": self.source_name,
-                        "error": msg if invalid_count > 0 else ""
+                        "message": item_msg
                     }
-                }
                 
-                write_report(spark, metric_data, stage="bronze")
+                # Write all record situations at once
+                if results_to_report:
+                    write_report(spark, results_to_report, stage="bronze")
             except Exception as e:
                 self.logger.error(f"Failed to write bronze quality report: {e}")
             
@@ -413,15 +426,15 @@ class BaseScraper(abc.ABC):
                         spark = SparkSession.builder.appName("Scraper_ErrorHandler").getOrCreate()
 
             # Chuyển đổi định dạng lỗi sang định dạng của quality_report
-            metric_name = f"scraper_error_{record.get('error_type', 'unknown')}"
+            dict_key = f"scraper_error_{record.get('error_type', 'unknown')}"
             
             error_data = {
-                metric_name: {
-                    "value": 1,
-                    "total": 1,
+                dict_key: {
+                    "metric_name": "scraper_system_error",
+                    "object": record.get("context", "unknown_context"),
                     "status": "FAIL",
                     "source": self.source_name,
-                    "error": f"[{record.get('context')}] {record.get('error_msg')}\n{record.get('traceback', '')}",
+                    "message": f"{record.get('error_type')}: {record.get('error_msg')}\n{record.get('traceback', '')}",
                 }
             }
             
