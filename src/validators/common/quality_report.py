@@ -31,6 +31,7 @@ def build_report(all_results: dict, stage: str) -> list[dict]:
                     "timestamp": timestamp,
                     "stage": stage,
                     "source": "unknown",
+                    "object": "system",
                     "metric_name": type(result).__name__,
                     "status": "FAIL",
                     "message": str(result),
@@ -42,7 +43,8 @@ def build_report(all_results: dict, stage: str) -> list[dict]:
                     "timestamp": timestamp,
                     "stage": stage,
                     "source": result.get("source", "unknown"),
-                    "metric_name": metric_name,
+                    "object": result.get("object", "batch"),
+                    "metric_name": result.get("metric_name", metric_name),
                     "status": result.get("status", "UNKNOWN"),
                     "message": result.get("error", result.get("message", "")),
                 }
@@ -74,6 +76,7 @@ def write_report(
                 StructField("timestamp", TimestampType(), False),
                 StructField("stage", StringType(), False),
                 StructField("source", StringType(), False),
+                StructField("object", StringType(), True),
                 StructField("metric_name", StringType(), False),
                 StructField("status", StringType(), False),
                 StructField("message", StringType(), True),
@@ -89,25 +92,17 @@ def write_report(
 
         df_report = spark.createDataFrame(rows, schema=report_schema)
 
-        # Optimize output for Delta Lake (Max 1GB per file)
-        spark.conf.set("spark.databricks.delta.optimizeWrite.enabled", "true")
-        spark.conf.set("spark.databricks.delta.autoCompact.enabled", "true")
-        spark.conf.set("spark.databricks.delta.properties.defaults.targetFileSize", "1073741824") # 1GB in bytes
-
         # Coalesce to 1 partition to prevent multiple small files per batch write
         df_report = df_report.coalesce(1)
 
-        # Append to the DQ metrics table (never overwrite historical records)
-        df_report.write.format("delta").mode("append").save(DQ_TABLE_PATH)
-
-        # Try to explicitly set table properties (works if table already exists)
+        # Ensure problematic autoOptimize table properties are unset to avoid CONFIG_NOT_AVAILABLE on Databricks Connect
         try:
-            spark.sql(f"ALTER TABLE delta.`{DQ_TABLE_PATH}` SET TBLPROPERTIES ("
-                      f"'delta.targetFileSize' = '1073741824', "
-                      f"'delta.autoOptimize.optimizeWrite' = 'true', "
-                      f"'delta.autoOptimize.autoCompact' = 'true')")
+            spark.sql(f"ALTER TABLE delta.`{DQ_TABLE_PATH}` UNSET TBLPROPERTIES ('delta.autoOptimize.optimizeWrite', 'delta.autoOptimize.autoCompact', 'delta.targetFileSize')")
         except Exception:
             pass
+
+        # Append to the DQ metrics table (never overwrite historical records)
+        df_report.write.format("delta").mode("append").option("mergeSchema", "true").save(DQ_TABLE_PATH)
 
         # Print summary to Databricks Job logs
         fail_count = sum(1 for r in rows if r["status"] == "FAIL")
