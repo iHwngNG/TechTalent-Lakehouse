@@ -18,32 +18,31 @@ def check_nulls(df: DataFrame, source: str) -> dict:
     }
     """
     try:
-        total = df.count()
         results = {}
-
-        for col_name in CRITICAL_COLUMNS:
-            metric_key = f"null_{col_name}"
-
-            try:
-                null_count = df.filter(
-                    col(col_name).isNull() | (col(col_name).cast("string") == "")
-                ).count()
-
-                status = "FAIL" if null_count > 0 else "PASS"
-                message = f"Found {null_count} nulls out of {total} records" if null_count > 0 else f"No nulls found in {total} records"
-                
-                results[metric_key] = {
-                    "status": status,
-                    "source": source,
-                    "message": message
-                }
-            except Exception as col_err:
-                results[metric_key] = {
-                    "status": "ERROR",
-                    "source": source,
-                    "error": str(col_err),
-                }
-
+        # Collect to process per object (fine for micro-batches)
+        records = df.collect()
+        
+        for row in records:
+            job_id = row["job_id"] if row["job_id"] else "unknown"
+            dict_key = f"null_check_{job_id}"
+            
+            missing = []
+            for col_name in CRITICAL_COLUMNS:
+                val = row[col_name]
+                if val is None or str(val).strip() == "":
+                    missing.append(col_name)
+            
+            status = "FAIL" if missing else "PASS"
+            message = f"Missing: {', '.join(missing)}" if missing else "Valid"
+            
+            results[dict_key] = {
+                "metric_name": "check_nulls",
+                "object": job_id,
+                "status": status,
+                "source": source,
+                "message": message
+            }
+            
         return results
 
     except Exception as e:

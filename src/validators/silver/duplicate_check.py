@@ -23,33 +23,47 @@ def check_duplicates(df: DataFrame, source: str) -> dict:
     }
     """
     try:
-        total = df.count()
-
+        results = {}
+        
         # Count occurrences of each composite key combination
         key_counts = (
             df.groupBy(*COMPOSITE_KEY)
             .agg(count("*").alias("cnt"))
-            .filter(col("cnt") > 1)
         )
-
-        # Sum up all duplicate rows (rows beyond the first occurrence)
-        dup_rows = key_counts.agg({"cnt": "sum"}).collect()[0][0]
-        duplicate_count = int(dup_rows) if dup_rows is not None else 0
-
-        status = "FAIL" if duplicate_count > 0 else "PASS"
-        message = f"Found {duplicate_count} duplicates out of {total} records" if duplicate_count > 0 else f"No duplicates found in {total} records"
-
-        return {
-            "duplicate_composite_key": {
+        
+        # Join back to original to get duplicate status per row
+        # To avoid complex joins, we can just collect key_counts and then collect df
+        counts_dict = {
+            (r["job_id"], r["source"]): r["cnt"] for r in key_counts.collect()
+        }
+        
+        records = df.collect()
+        for row in records:
+            jid = row["job_id"] if row["job_id"] else "unknown"
+            src = row["source"]
+            cnt = counts_dict.get((jid, src), 1)
+            
+            status = "FAIL" if cnt > 1 else "PASS"
+            message = f"Found {cnt} occurrences" if cnt > 1 else "No duplicates"
+            
+            # Use unique key combining job_id and a random suffix or just job_id
+            dict_key = f"dup_check_{jid}_{src}"
+            
+            results[dict_key] = {
+                "metric_name": "check_duplicates",
+                "object": jid,
                 "status": status,
                 "source": source,
                 "message": message
             }
-        }
-
+            
+        return results
+        
     except Exception as e:
         return {
-            "duplicate_composite_key": {
+            "duplicate_check_error": {
+                "metric_name": "check_duplicates",
+                "object": "system",
                 "status": "ERROR",
                 "source": source,
                 "error": str(e),
